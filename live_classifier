@@ -1,0 +1,264 @@
+import cv2
+import mediapipe as mp
+import numpy as np
+import joblib
+import pandas as pd
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
+
+# ── Загрузка модели и скейлера ───────────────────────────────────────────────
+model   = joblib.load('exercise_classifier_final.pkl')
+scaler  = joblib.load('angle_scaler_final.pkl')
+le      = joblib.load('label_encoder_final.pkl')
+
+# ── Настройка MediaPipe ──────────────────────────────────────────────────────
+base_options = python.BaseOptions(model_asset_path='pose_landmarker_full.task')
+options = vision.PoseLandmarkerOptions(
+    base_options=base_options,
+    output_segmentation_masks=False,
+    running_mode=vision.RunningMode.VIDEO,
+)
+detector = vision.PoseLandmarker.create_from_options(options)
+
+# ── Вспомогательные функции ──────────────────────────────────────────────────
+
+def angle(a, b, c):
+    """Угол в точке b между точками a и c (2D)"""
+    ba = np.array([a[0]-b[0], a[1]-b[1]])
+    bc = np.array([c[0]-b[0], c[1]-b[1]])
+    cos_angle = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc) + 1e-6)
+    return np.degrees(np.arccos(np.clip(cos_angle, -1.0, 1.0)))
+
+def get_xy(lm, idx):
+    """Возвращает (x, y) для точки по индексу"""
+    return (lm[idx].x, lm[idx].y)
+
+def extract_features(lm, prev_features=None):
+    """
+    Извлекает все 49 признаков из landmarks.
+    lm — список точек MediaPipe (33 точки)
+    prev_features — признаки предыдущего кадра для vel_* признаков
+    """
+
+    # Индексы MediaPipe Pose
+    NOSE           = 0
+    L_SHOULDER, R_SHOULDER = 11, 12
+    L_ELBOW,    R_ELBOW    = 13, 14
+    L_WRIST,    R_WRIST    = 15, 16
+    L_HIP,      R_HIP      = 23, 24
+    L_KNEE,     R_KNEE     = 25, 26
+    L_ANKLE,    R_ANKLE    = 27, 28
+    L_FOOT,     R_FOOT     = 31, 32
+
+    # Получаем координаты нужных точек
+    nose      = get_xy(lm, NOSE)
+    l_sh      = get_xy(lm, L_SHOULDER)
+    r_sh      = get_xy(lm, R_SHOULDER)
+    l_el      = get_xy(lm, L_ELBOW)
+    r_el      = get_xy(lm, R_ELBOW)
+    l_wr      = get_xy(lm, L_WRIST)
+    r_wr      = get_xy(lm, R_WRIST)
+    l_hip     = get_xy(lm, L_HIP)
+    r_hip     = get_xy(lm, R_HIP)
+    l_kn      = get_xy(lm, L_KNEE)
+    r_kn      = get_xy(lm, R_KNEE)
+    l_an      = get_xy(lm, L_ANKLE)
+    r_an      = get_xy(lm, R_ANKLE)
+    l_ft      = get_xy(lm, L_FOOT)
+    r_ft      = get_xy(lm, R_FOOT)
+
+    mid_sh  = ((l_sh[0]+r_sh[0])/2, (l_sh[1]+r_sh[1])/2)
+    mid_hip = ((l_hip[0]+r_hip[0])/2, (l_hip[1]+r_hip[1])/2)
+    mid_kn  = ((l_kn[0]+r_kn[0])/2, (l_kn[1]+r_kn[1])/2)
+    mid_an  = ((l_an[0]+r_an[0])/2, (l_an[1]+r_an[1])/2)
+    mid_wr  = ((l_wr[0]+r_wr[0])/2, (l_wr[1]+r_wr[1])/2)
+
+    f = {}
+
+    # ── Углы суставов ────────────────────────────────────────────────────────
+    f['left_elbow_angle']     = angle(l_sh,  l_el,  l_wr)
+    f['right_elbow_angle']    = angle(r_sh,  r_el,  r_wr)
+    f['left_shoulder_angle']  = angle(l_el,  l_sh,  l_hip)
+    f['right_shoulder_angle'] = angle(r_el,  r_sh,  r_hip)
+    f['left_knee_angle']      = angle(l_hip, l_kn,  l_an)
+    f['right_knee_angle']     = angle(r_hip, r_kn,  r_an)
+    f['left_hip_angle']       = angle(l_sh,  l_hip, l_kn)
+    f['right_hip_angle']      = angle(r_sh,  r_hip, r_kn)
+    f['left_ankle_angle']     = angle(l_kn,  l_an,  l_ft)
+    f['right_ankle_angle']    = angle(r_kn,  r_an,  r_ft)
+
+    # ── Туловище и голова ─────────────────────────────────────────────────────
+    f['trunk_lean'] = np.degrees(np.arctan2(
+        abs(mid_sh[0] - mid_hip[0]),
+        abs(mid_sh[1] - mid_hip[1]) + 1e-6))
+    f['head_tilt'] = np.degrees(np.arctan2(
+        abs(nose[0] - mid_sh[0]),
+        abs(nose[1] - mid_sh[1]) + 1e-6))
+
+    # ── Симметрия ─────────────────────────────────────────────────────────────
+    f['knee_symmetry']     = abs(f['left_knee_angle']     - f['right_knee_angle'])
+    f['elbow_symmetry']    = abs(f['left_elbow_angle']    - f['right_elbow_angle'])
+    f['shoulder_symmetry'] = abs(f['left_shoulder_angle'] - f['right_shoulder_angle'])
+    f['hip_symmetry']      = abs(f['left_hip_angle']      - f['right_hip_angle'])
+
+    # ── Геометрия стойки ──────────────────────────────────────────────────────
+    f['feet_width']             = abs(l_an[0] - r_an[0])
+    f['shoulder_width']         = abs(l_sh[0] - r_sh[0])
+    f['feet_to_shoulder_ratio'] = f['feet_width'] / (f['shoulder_width'] + 1e-6)
+    f['hip_height']             = mid_hip[1] - mid_sh[1]
+
+    # ── Ориентация тела ───────────────────────────────────────────────────────
+    f['body_vertical_range']   = abs(nose[1] - mid_an[1])
+    f['body_horizontal_range'] = abs(l_wr[0]-r_wr[0]) + abs(l_an[0]-r_an[0])
+    f['body_aspect_ratio']     = f['body_vertical_range'] / (f['body_horizontal_range'] + 1e-6)
+    f['shoulder_vs_hip_y']     = mid_sh[1] - mid_hip[1]
+    f['wrist_vs_shoulder_y']   = mid_wr[1] - mid_sh[1]
+    f['knee_vs_hip_y']         = mid_kn[1] - mid_hip[1]
+
+    # ── Углы рук и колени ─────────────────────────────────────────────────────
+    f['left_arm_raise']      = angle(l_hip, l_sh, l_el)
+    f['right_arm_raise']     = angle(r_hip, r_sh, r_el)
+    f['arm_span']            = abs(l_wr[0] - r_wr[0])
+    f['hip_span']            = abs(l_hip[0] - r_hip[0])
+    f['arm_to_hip_ratio']    = f['arm_span'] / (f['hip_span'] + 1e-6)
+    f['left_knee_valgus']    = l_kn[0] - l_hip[0]
+    f['right_knee_valgus']   = r_kn[0] - r_hip[0]
+    f['knee_height_avg']     = (l_kn[1] + r_kn[1]) / 2
+
+    # ── Временные признаки (скорость изменения) ───────────────────────────────
+    vel_cols = [
+        'left_elbow_angle', 'right_elbow_angle',
+        'left_shoulder_angle', 'right_shoulder_angle',
+        'left_knee_angle', 'right_knee_angle',
+        'left_hip_angle', 'right_hip_angle',
+        'trunk_lean', 'hip_height',
+        'body_vertical_range', 'wrist_vs_shoulder_y',
+        'left_arm_raise', 'right_arm_raise',
+        'knee_height_avg'
+    ]
+    for col in vel_cols:
+        if prev_features is not None:
+            f[f'vel_{col}'] = f[col] - prev_features.get(col, f[col])
+        else:
+            f[f'vel_{col}'] = 0.0
+
+    return f
+
+
+def predict_exercise(features_dict):
+    """Превращает словарь признаков в предсказание модели"""
+    # Важно: порядок колонок должен совпадать с тем что видела модель при обучении
+    col_order = scaler.feature_names_in_
+    X = pd.DataFrame([features_dict])[col_order]
+    X_scaled = scaler.transform(X)
+    pred_idx = model.predict(X_scaled)[0]
+    proba    = model.predict_proba(X_scaled)[0]
+    label    = le.inverse_transform([pred_idx])[0]
+    confidence = proba[pred_idx]
+    return label, confidence
+
+
+# ── Словарь для красивого отображения ────────────────────────────────────────
+DISPLAY_NAMES = {
+    'pushups_down': 'Push-ups (down)',
+    'pushups_up':   'Push-ups (up)',
+    'squats_down':  'Squats (down)',
+    'squats_up':    'Squats (up)',
+}
+
+COLORS = {
+    'pushups_down': (0, 255, 100),
+    'pushups_up':   (0, 255, 100),
+    'squats_down':  (0, 100, 255),
+    'squats_up':    (0, 100, 255),
+}
+
+# ── Соединения скелета ────────────────────────────────────────────────────────
+CONNECTIONS = [
+    (11, 12), (11, 13), (13, 15), (12, 14), (14, 16),
+    (11, 23), (12, 24), (23, 24),
+    (23, 25), (25, 27), (24, 26), (26, 28),
+    (27, 31), (28, 32),
+]
+
+# ── Главный цикл ─────────────────────────────────────────────────────────────
+cap = cv2.VideoCapture(0)
+prev_features = None
+label, confidence = 'Waiting for pose...', 0.0
+
+# Для сглаживания предсказаний — берём среднее по последним N кадрам
+from collections import deque
+prediction_buffer = deque(maxlen=10)
+
+timestamp_counter = 0  # ручной счётчик на случай если CAP_PROP_POS_MSEC = 0
+
+while cap.isOpened():
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    h, w, _ = frame.shape
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+
+    # Timestamp — используем ручной счётчик чтобы избежать проблем с камерой
+    timestamp_counter += 33  # ~30 fps = 33ms на кадр
+    result = detector.detect_for_video(mp_image, timestamp_counter)
+
+    if result.pose_landmarks:
+        lm = result.pose_landmarks[0]
+
+        # Рисуем скелет
+        color = COLORS.get(label, (0, 255, 0))
+        for start_idx, end_idx in CONNECTIONS:
+            x1, y1 = int(lm[start_idx].x * w), int(lm[start_idx].y * h)
+            x2, y2 = int(lm[end_idx].x * w),   int(lm[end_idx].y * h)
+            cv2.line(frame, (x1, y1), (x2, y2), color, 2)
+
+        for point in lm:
+            x, y = int(point.x * w), int(point.y * h)
+            cv2.circle(frame, (x, y), 4, (255, 255, 255), -1)
+
+        # Извлекаем признаки и делаем предсказание
+        try:
+            features_dict = extract_features(lm, prev_features)
+            new_label, new_conf = predict_exercise(features_dict)
+
+            # Буфер сглаживания — берём самое частое предсказание за 10 кадров
+            prediction_buffer.append(new_label)
+            from collections import Counter
+            label = Counter(prediction_buffer).most_common(1)[0][0]
+            confidence = new_conf
+
+            prev_features = features_dict
+        except Exception as e:
+            pass  # если что-то пошло не так — просто пропускаем кадр
+
+    # ── Отрисовка интерфейса ─────────────────────────────────────────────────
+    # Полупрозрачный фон для текста
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (0, 0), (400, 80), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.5, frame, 0.5, 0, frame)
+
+    # Название упражнения
+    display_name = DISPLAY_NAMES.get(label, label)
+    text_color   = COLORS.get(label, (0, 255, 0))
+    cv2.putText(frame, display_name, (10, 35),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, text_color, 2)
+
+    # Уверенность модели
+    conf_text = f'Confidence: {confidence*100:.0f}%'
+    cv2.putText(frame, conf_text, (10, 62),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+
+    # Полоска уверенности
+    bar_w = int(confidence * 200)
+    cv2.rectangle(frame, (10, 70), (210, 78), (50, 50, 50), -1)
+    cv2.rectangle(frame, (10, 70), (10 + bar_w, 78), text_color, -1)
+
+    cv2.imshow('Exercise Classifier', frame)
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+cap.release()
+cv2.destroyAllWindows()

@@ -1,0 +1,183 @@
+import cv2
+import mediapipe as mp
+import pandas as pd
+import time
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
+
+# ── Настройка MediaPipe ──────────────────────────────────────────────────────
+base_options = python.BaseOptions(model_asset_path='pose_landmarker_full.task')
+options = vision.PoseLandmarkerOptions(
+    base_options=base_options,
+    output_segmentation_masks=False,
+    running_mode=vision.RunningMode.VIDEO,
+)
+detector = vision.PoseLandmarker.create_from_options(options)
+
+# ── Настройки записи ─────────────────────────────────────────────────────────
+# Сколько кадров записывать на каждый класс
+FRAMES_PER_CLASS = 150  # ~5 секунд при 30fps
+
+CLASSES = {
+    '1': 'squats_down',   # нажми 1 когда сидишь внизу
+    '2': 'squats_up',     # нажми 2 когда стоишь прямо после приседания
+    '3': 'pushups_down',  # нажми 3 когда внизу отжимания
+    '4': 'pushups_up',    # нажми 4 когда вверху отжимания
+}
+
+COLORS = {
+    'squats_down':  (0, 100, 255),
+    'squats_up':    (0, 100, 255),
+    'pushups_down': (0, 255, 100),
+    'pushups_up':   (0, 255, 100),
+}
+
+CONNECTIONS = [
+    (11, 12), (11, 13), (13, 15), (12, 14), (14, 16),
+    (11, 23), (12, 24), (23, 24),
+    (23, 25), (25, 27), (24, 26), (26, 28),
+    (27, 31), (28, 32),
+]
+
+LANDMARK_NAMES = [
+    'nose','left_eye_inner','left_eye','left_eye_outer',
+    'right_eye_inner','right_eye','right_eye_outer',
+    'left_ear','right_ear','mouth_left','mouth_right',
+    'left_shoulder','right_shoulder','left_elbow','right_elbow',
+    'left_wrist','right_wrist','left_pinky_1','right_pinky_1',
+    'left_index_1','right_index_1','left_thumb_2','right_thumb_2',
+    'left_hip','right_hip','left_knee','right_knee',
+    'left_ankle','right_ankle','left_heel','right_heel',
+    'left_foot_index','right_foot_index',
+]
+
+# ── Сбор данных ───────────────────────────────────────────────────────────────
+all_rows   = []
+pose_id    = 0
+current_class   = None
+recording       = False
+frames_recorded = 0
+countdown       = 0
+countdown_start = 0
+
+cap = cv2.VideoCapture(0)
+timestamp_counter = 0
+
+print('Инструкция:')
+print('  1 — начать запись squats_down  (присядь вниз и держи позу)')
+print('  2 — начать запись squats_up    (встань прямо)')
+print('  3 — начать запись pushups_down (опустись в отжимание)')
+print('  4 — начать запись pushups_up   (поднимись в отжимание)')
+print('  S — сохранить данные в CSV')
+print('  Q — выйти')
+print()
+print(f'На каждый класс записывается {FRAMES_PER_CLASS} кадров (~5 сек)')
+
+while cap.isOpened():
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    h, w, _ = frame.shape
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+
+    timestamp_counter += 33
+    result = detector.detect_for_video(mp_image, timestamp_counter)
+
+    skeleton_color = (100, 100, 100)  # серый если не записываем
+
+    if result.pose_landmarks:
+        lm = result.pose_landmarks[0]
+
+        # Цвет скелета зависит от текущего класса
+        if current_class:
+            skeleton_color = COLORS.get(current_class, (0, 255, 0))
+
+        # Рисуем скелет
+        for start_idx, end_idx in CONNECTIONS:
+            x1, y1 = int(lm[start_idx].x * w), int(lm[start_idx].y * h)
+            x2, y2 = int(lm[end_idx].x * w),   int(lm[end_idx].y * h)
+            cv2.line(frame, (x1, y1), (x2, y2), skeleton_color, 2)
+        for point in lm:
+            cv2.circle(frame, (int(point.x * w), int(point.y * h)), 4, (255, 255, 255), -1)
+
+        # Обратный отсчёт перед записью
+        if countdown > 0:
+            elapsed = time.time() - countdown_start
+            remaining = countdown - int(elapsed)
+            if remaining > 0:
+                cv2.putText(frame, f'Get ready: {remaining}', (w//2 - 100, h//2),
+                            cv2.FONT_HERSHEY_SIMPLEX, 2.0, (0, 255, 255), 3)
+            else:
+                countdown = 0
+                recording = True
+                frames_recorded = 0
+
+        # Запись кадра
+        elif recording and current_class:
+            row = {'pose_id': pose_id, 'pose': current_class}
+            for i, name in enumerate(LANDMARK_NAMES):
+                row[f'x_{name}'] = lm[i].x
+                row[f'y_{name}'] = lm[i].y
+                row[f'z_{name}'] = lm[i].z
+            all_rows.append(row)
+            pose_id += 1
+            frames_recorded += 1
+
+            # Прогресс бар
+            progress = int((frames_recorded / FRAMES_PER_CLASS) * (w - 20))
+            cv2.rectangle(frame, (10, h-30), (w-10, h-10), (50, 50, 50), -1)
+            cv2.rectangle(frame, (10, h-30), (10 + progress, h-10), skeleton_color, -1)
+            cv2.putText(frame, f'Recording {current_class}: {frames_recorded}/{FRAMES_PER_CLASS}',
+                        (10, h-35), cv2.FONT_HERSHEY_SIMPLEX, 0.6, skeleton_color, 2)
+
+            if frames_recorded >= FRAMES_PER_CLASS:
+                recording = False
+                print(f'Записано {FRAMES_PER_CLASS} кадров для {current_class}')
+                current_class = None
+
+    # ── Интерфейс ─────────────────────────────────────────────────────────────
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (0, 0), (w, 60), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.5, frame, 0.5, 0, frame)
+
+    # Статус записанных классов
+    recorded_classes = set(r['pose'] for r in all_rows)
+    status_parts = []
+    for key, cls in CLASSES.items():
+        count = sum(1 for r in all_rows if r['pose'] == cls)
+        status_parts.append(f'{key}:{cls.split("_")[0]}({count})')
+    cv2.putText(frame, '  '.join(status_parts), (10, 20),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
+
+    if not recording and countdown == 0:
+        cv2.putText(frame, 'Press 1-4 to record | S to save | Q to quit',
+                    (10, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (150, 150, 150), 1)
+    
+    cv2.imshow('Data Collector', frame)
+
+    key = cv2.waitKey(1) & 0xFF
+
+    if key == ord('q'):
+        break
+
+    elif key == ord('s'):
+        if all_rows:
+            df = pd.DataFrame(all_rows)
+            df.to_csv(r'Datasets\my_landmarks.csv', index=False)
+            print(f'Сохранено {len(df)} строк в Datasets/my_landmarks.csv')
+            print('Распределение:', df['pose'].value_counts().to_dict())
+        else:
+            print('Нет данных для сохранения')
+
+    elif not recording and countdown == 0:
+        cls_key = chr(key) if key < 128 else None
+        if cls_key in CLASSES:
+            current_class = CLASSES[cls_key]
+            countdown = 3
+            countdown_start = time.time()
+            print(f'Подготовка к записи: {current_class}...')
+
+cap.release()
+cv2.destroyAllWindows()
