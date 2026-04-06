@@ -1,262 +1,338 @@
+
 import cv2
 import mediapipe as mp
 import numpy as np
 import joblib
 import pandas as pd
+from collections import deque, Counter
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
+import os
 
-# ── Загрузка модели и скейлера ───────────────────────────────────────────────
-model   = joblib.load('exercise_classifier_final.pkl')
-scaler  = joblib.load('angle_scaler_final.pkl')
-le      = joblib.load('label_encoder_final.pkl')
+# Загружаем обученные артефакты. Порядок фичей (feature_order) критичен:
+# без него XGBoost на инференсе получит колонки не в том порядке и сломается.
+model = joblib.load('exercise_classifier_final.pkl')
+scaler = joblib.load('angle_scaler_final.pkl')
+le = joblib.load('label_encoder_final.pkl')
+feature_order = joblib.load('feature_order.pkl')
 
-# ── Настройка MediaPipe ──────────────────────────────────────────────────────
+# Подгружаем базовые метрики правильной формы из эталонных CSV.
+# Разделяем по фазам (down/up), чтобы пороги глубины и выпрямления не конфликтовали.
+REF_DIR = r'Datasets'
+ref_stats = {}
+for phase in ['squats_down', 'squats_up']:
+    path = os.path.join(REF_DIR, f'reference_{phase}.csv')
+    if os.path.exists(path):
+        df = pd.read_csv(path)
+        stats = {}
+        for col in df.columns:
+            if col.startswith('ref_'):
+                key = col[4:]
+                m, s = df[col].mean(), df[col].std()
+                # Ограничиваем минимальный std: если в записи эталона был шум или резкие движения,
+                # модель не будет триггерить ошибки на каждом микро-смещении.
+                if 'angle' in key or 'lean' in key:
+                    s = max(s, 5.0)
+                elif 'ratio' in key or 'offset' in key:
+                    s = max(s, 0.05)
+                stats[key] = {'mean': m, 'std': s}
+        ref_stats[phase] = stats
+
+if not ref_stats:
+    print("Warning: Reference files not found. Form analysis disabled.")
+
+# Инициализируем детектор поз в режиме VIDEO. Он использует трекинг между кадрами,
+# что даёт более стабильные координаты, чем режим IMAGE.
 base_options = python.BaseOptions(model_asset_path='pose_landmarker_full.task')
-options = vision.PoseLandmarkerOptions(
-    base_options=base_options,
-    output_segmentation_masks=False,
-    running_mode=vision.RunningMode.VIDEO,
-)
+options = vision.PoseLandmarkerOptions(base_options=base_options, running_mode=vision.RunningMode.VIDEO)
 detector = vision.PoseLandmarker.create_from_options(options)
 
-# ── Вспомогательные функции ──────────────────────────────────────────────────
+def calculate_angle(a, b, c):
+    """Считаем угол в точке b через скалярное произведение векторов ba и bc.
+    clip() и эпсилон защищают от math domain error при коллинеарных или нулевых векторах."""
+    ba = np.array(a) - np.array(b)
+    bc = np.array(c) - np.array(b)
+    norm_ba, norm_bc = np.linalg.norm(ba), np.linalg.norm(bc)
+    if norm_ba * norm_bc < 1e-8:
+        return 0.0
+    cos_val = np.dot(ba, bc) / (norm_ba * norm_bc)
+    return np.degrees(np.arccos(np.clip(cos_val, -1.0, 1.0)))
 
-def angle(a, b, c):
-    """Угол в точке b между точками a и c (2D)"""
-    ba = np.array([a[0]-b[0], a[1]-b[1]])
-    bc = np.array([c[0]-b[0], c[1]-b[1]])
-    cos_angle = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc) + 1e-6)
-    return np.degrees(np.arccos(np.clip(cos_angle, -1.0, 1.0)))
+def get_coords(lm):
+    """Маппим индексы MediaPipe на человекочитаемые имена.
+    Если детектор потерял точку (частое явление при поворотах/заслонах), возвращаем NaN,
+    чтобы дальнейшие расчёты корректно отфильтровали кадр."""
+    idx_map = {
+        'nose': 0, 'left_shoulder': 11, 'right_shoulder': 12,
+        'left_elbow': 13, 'right_elbow': 14, 'left_wrist': 15, 'right_wrist': 16,
+        'left_hip': 23, 'right_hip': 24, 'left_knee': 25, 'right_knee': 26,
+        'left_ankle': 27, 'right_ankle': 28, 'left_heel': 29, 'right_heel': 30,
+        'left_foot_index': 31, 'right_foot_index': 32
+    }
+    coords = {}
+    for name, idx in idx_map.items():
+        coords[name] = np.array([lm[idx].x, lm[idx].y]) if idx < len(lm) else np.array([np.nan, np.nan])
+    return coords
 
-def get_xy(lm, idx):
-    """Возвращает (x, y) для точки по индексу"""
-    return (lm[idx].x, lm[idx].y)
-
-def extract_features(lm, prev_features=None):
-    """
-    Извлекает все 49 признаков из landmarks.
-    lm — список точек MediaPipe (33 точки)
-    prev_features — признаки предыдущего кадра для vel_* признаков
-    """
-
-    # Индексы MediaPipe Pose
-    NOSE           = 0
-    L_SHOULDER, R_SHOULDER = 11, 12
-    L_ELBOW,    R_ELBOW    = 13, 14
-    L_WRIST,    R_WRIST    = 15, 16
-    L_HIP,      R_HIP      = 23, 24
-    L_KNEE,     R_KNEE     = 25, 26
-    L_ANKLE,    R_ANKLE    = 27, 28
-    L_FOOT,     R_FOOT     = 31, 32
-
-    # Получаем координаты нужных точек
-    nose      = get_xy(lm, NOSE)
-    l_sh      = get_xy(lm, L_SHOULDER)
-    r_sh      = get_xy(lm, R_SHOULDER)
-    l_el      = get_xy(lm, L_ELBOW)
-    r_el      = get_xy(lm, R_ELBOW)
-    l_wr      = get_xy(lm, L_WRIST)
-    r_wr      = get_xy(lm, R_WRIST)
-    l_hip     = get_xy(lm, L_HIP)
-    r_hip     = get_xy(lm, R_HIP)
-    l_kn      = get_xy(lm, L_KNEE)
-    r_kn      = get_xy(lm, R_KNEE)
-    l_an      = get_xy(lm, L_ANKLE)
-    r_an      = get_xy(lm, R_ANKLE)
-    l_ft      = get_xy(lm, L_FOOT)
-    r_ft      = get_xy(lm, R_FOOT)
-
-    mid_sh  = ((l_sh[0]+r_sh[0])/2, (l_sh[1]+r_sh[1])/2)
-    mid_hip = ((l_hip[0]+r_hip[0])/2, (l_hip[1]+r_hip[1])/2)
-    mid_kn  = ((l_kn[0]+r_kn[0])/2, (l_kn[1]+r_kn[1])/2)
-    mid_an  = ((l_an[0]+r_an[0])/2, (l_an[1]+r_an[1])/2)
-    mid_wr  = ((l_wr[0]+r_wr[0])/2, (l_wr[1]+r_wr[1])/2)
-
+def extract_features_for_model(lm, prev=None):
+    """Формируем полный набор признаков для XGBoost.
+    Ключевой момент: нормализуем координаты относительно центра таза и размера торса.
+    Это делает фичи инвариантными к дистанции до камеры, росту человека и кропу кадра."""
     f = {}
+    c = get_coords(lm)
+    if any(np.isnan(c[k]).any() for k in ['nose', 'left_hip', 'right_hip']):
+        return None
 
-    # ── Углы суставов ────────────────────────────────────────────────────────
-    f['left_elbow_angle']     = angle(l_sh,  l_el,  l_wr)
-    f['right_elbow_angle']    = angle(r_sh,  r_el,  r_wr)
-    f['left_shoulder_angle']  = angle(l_el,  l_sh,  l_hip)
-    f['right_shoulder_angle'] = angle(r_el,  r_sh,  r_hip)
-    f['left_knee_angle']      = angle(l_hip, l_kn,  l_an)
-    f['right_knee_angle']     = angle(r_hip, r_kn,  r_an)
-    f['left_hip_angle']       = angle(l_sh,  l_hip, l_kn)
-    f['right_hip_angle']      = angle(r_sh,  r_hip, r_kn)
-    f['left_ankle_angle']     = angle(l_kn,  l_an,  l_ft)
-    f['right_ankle_angle']    = angle(r_kn,  r_an,  r_ft)
+    l_hip, r_hip = c['left_hip'], c['right_hip']
+    center = (l_hip + r_hip) / 2
+    l_sh, r_sh = c['left_shoulder'], c['right_shoulder']
+    scale = np.linalg.norm((l_sh + r_sh)/2 - center) + 1e-6
 
-    # ── Туловище и голова ─────────────────────────────────────────────────────
-    f['trunk_lean'] = np.degrees(np.arctan2(
-        abs(mid_sh[0] - mid_hip[0]),
-        abs(mid_sh[1] - mid_hip[1]) + 1e-6))
-    f['head_tilt'] = np.degrees(np.arctan2(
-        abs(nose[0] - mid_sh[0]),
-        abs(nose[1] - mid_sh[1]) + 1e-6))
+    def n(k): return (c[k] - center) / scale
 
-    # ── Симметрия ─────────────────────────────────────────────────────────────
-    f['knee_symmetry']     = abs(f['left_knee_angle']     - f['right_knee_angle'])
-    f['elbow_symmetry']    = abs(f['left_elbow_angle']    - f['right_elbow_angle'])
+    mid_sh = (n('left_shoulder') + n('right_shoulder')) / 2
+    mid_hip = (n('left_hip') + n('right_hip')) / 2
+    nose = n('nose')
+
+    # Углы в суставах. Левая и правая сторона считаются отдельно для детекции асимметрии.
+    f['left_elbow_angle'] = calculate_angle(n('left_shoulder'), n('left_elbow'), n('left_wrist'))
+    f['right_elbow_angle'] = calculate_angle(n('right_shoulder'), n('right_elbow'), n('right_wrist'))
+    f['left_shoulder_angle'] = calculate_angle(n('left_elbow'), n('left_shoulder'), n('left_hip'))
+    f['right_shoulder_angle'] = calculate_angle(n('right_elbow'), n('right_shoulder'), n('right_hip'))
+    f['left_knee_angle'] = calculate_angle(n('left_hip'), n('left_knee'), n('left_ankle'))
+    f['right_knee_angle'] = calculate_angle(n('right_hip'), n('right_knee'), n('right_ankle'))
+    f['left_hip_angle'] = calculate_angle(n('left_shoulder'), n('left_hip'), n('left_knee'))
+    f['right_hip_angle'] = calculate_angle(n('right_shoulder'), n('right_hip'), n('right_knee'))
+    f['left_ankle_angle'] = calculate_angle(n('left_knee'), n('left_ankle'), n('left_foot_index'))
+    f['right_ankle_angle'] = calculate_angle(n('right_knee'), n('right_ankle'), n('right_foot_index'))
+
+    # Глобальная ориентация тела
+    f['trunk_lean'] = np.degrees(np.arctan2(abs(mid_sh[0]-mid_hip[0]), abs(mid_sh[1]-mid_hip[1])+1e-6))
+    f['head_tilt'] = np.degrees(np.arctan2(abs(nose[0]-mid_sh[0]), abs(nose[1]-mid_sh[1])+1e-6))
+    f['body_verticality'] = abs(mid_sh[1]-mid_hip[1])
+    f['body_horizontal'] = abs(mid_sh[0]-mid_hip[0])
+    f['orientation_ratio'] = f['body_verticality'] / (f['body_horizontal']+1e-6)
+
+    # Аспект-райт bounding box тела: вертикальные позы > 1.0, горизонтальные < 1.0.
+    # Главный признак, отделяющий приседания от отжиманий при любой технике.
+    all_y = [n(k)[1] for k in c]
+    all_x = [n(k)[0] for k in c]
+    f['bbox_aspect'] = (max(all_y)-min(all_y)+1e-6) / (max(all_x)-min(all_x)+1e-6)
+
+    # Симметрии и пропорции
+    f['knee_symmetry'] = abs(f['left_knee_angle'] - f['right_knee_angle'])
+    f['elbow_symmetry'] = abs(f['left_elbow_angle'] - f['right_elbow_angle'])
     f['shoulder_symmetry'] = abs(f['left_shoulder_angle'] - f['right_shoulder_angle'])
-    f['hip_symmetry']      = abs(f['left_hip_angle']      - f['right_hip_angle'])
+    f['hip_symmetry'] = abs(f['left_hip_angle'] - f['right_hip_angle'])
+    f['feet_width'] = np.linalg.norm(n('left_ankle') - n('right_ankle'))
+    f['shoulder_width'] = np.linalg.norm(n('left_shoulder') - n('right_shoulder'))
+    f['feet_to_shoulder_ratio'] = f['feet_width'] / (f['shoulder_width']+1e-6)
+    f['hip_height'] = mid_hip[1] - mid_sh[1]
+    f['height_ratio'] = np.linalg.norm(mid_sh-mid_hip) / (f['shoulder_width']+1e-6)
 
-    # ── Геометрия стойки ──────────────────────────────────────────────────────
-    f['feet_width']             = abs(l_an[0] - r_an[0])
-    f['shoulder_width']         = abs(l_sh[0] - r_sh[0])
-    f['feet_to_shoulder_ratio'] = f['feet_width'] / (f['shoulder_width'] + 1e-6)
-    f['hip_height']             = mid_hip[1] - mid_sh[1]
-
-    # ── Ориентация тела ───────────────────────────────────────────────────────
-    f['body_vertical_range']   = abs(nose[1] - mid_an[1])
-    f['body_horizontal_range'] = abs(l_wr[0]-r_wr[0]) + abs(l_an[0]-r_an[0])
-    f['body_aspect_ratio']     = f['body_vertical_range'] / (f['body_horizontal_range'] + 1e-6)
-    f['shoulder_vs_hip_y']     = mid_sh[1] - mid_hip[1]
-    f['wrist_vs_shoulder_y']   = mid_wr[1] - mid_sh[1]
-    f['knee_vs_hip_y']         = mid_kn[1] - mid_hip[1]
-
-    # ── Углы рук и колени ─────────────────────────────────────────────────────
-    f['left_arm_raise']      = angle(l_hip, l_sh, l_el)
-    f['right_arm_raise']     = angle(r_hip, r_sh, r_el)
-    f['arm_span']            = abs(l_wr[0] - r_wr[0])
-    f['hip_span']            = abs(l_hip[0] - r_hip[0])
-    f['arm_to_hip_ratio']    = f['arm_span'] / (f['hip_span'] + 1e-6)
-    f['left_knee_valgus']    = l_kn[0] - l_hip[0]
-    f['right_knee_valgus']   = r_kn[0] - r_hip[0]
-    f['knee_height_avg']     = (l_kn[1] + r_kn[1]) / 2
-
-    # ── Временные признаки (скорость изменения) ───────────────────────────────
-    vel_cols = [
-        'left_elbow_angle', 'right_elbow_angle',
-        'left_shoulder_angle', 'right_shoulder_angle',
-        'left_knee_angle', 'right_knee_angle',
-        'left_hip_angle', 'right_hip_angle',
-        'trunk_lean', 'hip_height',
-        'body_vertical_range', 'wrist_vs_shoulder_y',
-        'left_arm_raise', 'right_arm_raise',
-        'knee_height_avg'
-    ]
+    # Скорость изменения углов. Модель использует их для понимания фазы движения,
+    # а не только статики. Считаем разницу с предыдущим кадром.
+    vel_cols = ['left_elbow_angle','right_elbow_angle','left_shoulder_angle','right_shoulder_angle',
+                'left_knee_angle','right_knee_angle','left_hip_angle','right_hip_angle',
+                'trunk_lean','hip_height']
     for col in vel_cols:
-        if prev_features is not None:
-            f[f'vel_{col}'] = f[col] - prev_features.get(col, f[col])
-        else:
-            f[f'vel_{col}'] = 0.0
+        f[f'vel_{col}'] = (f[col] - prev[col]) if prev and col in prev else 0.0
 
     return f
 
+def extract_features_for_analysis(lm):
+    """Отдельный набор метрик только для проверки техники.
+    Не зависит от признаков классификатора — можно менять логику анализа без переобучения модели."""
+    f = {}
+    c = get_coords(lm)
+    if any(np.isnan(c[k]).any() for k in ['left_hip', 'right_hip']):
+        return None
 
-def predict_exercise(features_dict):
-    """Превращает словарь признаков в предсказание модели"""
-    # Важно: порядок колонок должен совпадать с тем что видела модель при обучении
-    col_order = scaler.feature_names_in_
-    X = pd.DataFrame([features_dict])[col_order]
+    l_hip, r_hip = c['left_hip'], c['right_hip']
+    center = (l_hip + r_hip) / 2
+    l_sh, r_sh = c['left_shoulder'], c['right_shoulder']
+    scale = np.linalg.norm((l_sh + r_sh)/2 - center) + 1e-6
+    def n(k): return (c[k] - center) / scale
+
+    mid_sh = (n('left_shoulder') + n('right_shoulder')) / 2
+    mid_hip = (n('left_hip') + n('right_hip')) / 2
+
+    f['avg_knee_angle'] = (calculate_angle(n('left_hip'), n('left_knee'), n('left_ankle')) +
+                           calculate_angle(n('right_hip'), n('right_knee'), n('right_ankle'))) / 2
+    f['avg_shoulder_angle'] = (calculate_angle(n('left_elbow'), n('left_shoulder'), n('left_hip')) +
+                               calculate_angle(n('right_elbow'), n('right_shoulder'), n('right_hip'))) / 2
+    f['trunk_lean'] = np.degrees(np.arctan2(abs(mid_sh[0]-mid_hip[0]), abs(mid_sh[1]-mid_hip[1])+1e-6))
+    f['stance_ratio'] = np.linalg.norm(n('left_ankle')-n('right_ankle')) / (np.linalg.norm(n('left_shoulder')-n('right_shoulder'))+1e-6)
+    f['hip_shoulder_offset'] = abs((n('left_hip')[0]+n('right_hip')[0])/2 - (n('left_shoulder')[0]+n('right_shoulder')[0])/2)
+    f['knee_symmetry'] = abs(calculate_angle(n('left_hip'), n('left_knee'), n('left_ankle')) -
+                             calculate_angle(n('right_hip'), n('right_knee'), n('right_ankle')))
+
+    # Геометрия отрыва пяток. В системе MediaPipe Y растёт вниз.
+    # Если Y пятки меньше Y носка стопы — пятка физически приподнята над полом.
+    f['left_heel_lift'] = c['left_heel'][1] - c['left_foot_index'][1]
+    f['right_heel_lift'] = c['right_heel'][1] - c['right_foot_index'][1]
+    return f
+
+def predict_exercise(feat_dict):
+    """Безопасный инференс. Подставляем 0.0 для отсутствующих фичей и строго соблюдаем
+    порядок колонок, который был при обучении, иначе XGBoost выдаст ошибку."""
+    col_order = scaler.feature_names_in_ if hasattr(scaler, 'feature_names_in_') else feature_order
+    X = pd.DataFrame([{k: feat_dict.get(k, 0.0) for k in col_order}])
     X_scaled = scaler.transform(X)
-    pred_idx = model.predict(X_scaled)[0]
-    proba    = model.predict_proba(X_scaled)[0]
-    label    = le.inverse_transform([pred_idx])[0]
-    confidence = proba[pred_idx]
-    return label, confidence
+    pred = model.predict(X_scaled)[0]
+    proba = model.predict_proba(X_scaled)[0]
+    return le.inverse_transform([pred])[0], float(proba[pred])
 
+def detect_errors(analysis_feat, phase, ref_data, prev_knee_angle):
+    """Проверка техники относительно эталона. Возвращает список ошибок и текущий угол коленей
+    для расчёта скорости на следующем кадре (стабилизационный гейт)."""
+    errors = []
+    new_knee_angle = prev_knee_angle
 
-# ── Словарь для красивого отображения ────────────────────────────────────────
+    if not analysis_feat or phase not in ref_data:
+        return errors, new_knee_angle
+
+    stats = ref_data[phase]
+    current_knee = analysis_feat.get('avg_knee_angle', 0)
+    new_knee_angle = current_knee
+
+    # Стабилизационный гейт: если колени движутся быстро (>8°/кадр), человек в динамике.
+    # В этот момент не проверяем технику, чтобы не спамить ложными ошибками во время перехода фаз.
+    is_stable = True
+    if prev_knee_angle is not None:
+        if abs(current_knee - prev_knee_angle) > 8.0:
+            is_stable = False
+
+    def check(key, desc, condition):
+        """Сравниваем метрику с эталоном: выход за mean ± k*std считается отклонением."""
+        if key not in stats or key not in analysis_feat:
+            return
+        val, m, s = analysis_feat[key], stats[key]['mean'], stats[key]['std']
+        if condition(val, m, s):
+            errors.append(desc)
+
+    # Геометрическая проверка отрыва пяток. Срабатывает только в нижней фазе.
+    # Порог -0.02 компенсирует шум детекции и естественный изгиб стопы.
+    if phase == 'squats_down':
+        threshold = -0.02
+        if analysis_feat.get('left_heel_lift', 0) < threshold or analysis_feat.get('right_heel_lift', 0) < threshold:
+            errors.append("Heels lifting")
+
+    # Фазо-зависимые проверки: глубина и наклон внизу, выпрямление и осанка наверху.
+    # Общие проверки (ширина стойки, асимметрия) работают в обеих фазах.
+    if is_stable:
+        if phase == 'squats_down':
+            check('avg_knee_angle', 'Insufficient depth', lambda v, m, s: v > m + 1.0*s)
+            check('trunk_lean', 'Excessive forward lean', lambda v, m, s: v > m + 1.5*s)
+        elif phase == 'squats_up':
+            check('avg_knee_angle', 'Not fully extended', lambda v, m, s: v < m - 1.5*s)
+            check('avg_shoulder_angle', 'Rounded upper back', lambda v, m, s: v < m - 1.0*s)
+            check('hip_shoulder_offset', 'Hips shifting', lambda v, m, s: v > m + 1.5*s)
+            check('trunk_lean', 'Leaning at top', lambda v, m, s: v > m + 1.0*s)
+
+        check('stance_ratio', 'Stance width off', lambda v, m, s: abs(v-m) > 1.5*s)
+        check('knee_symmetry', 'Leg asymmetry', lambda v, m, s: v > m + 1.5*s)
+
+    return errors, new_knee_angle
+
+# Маппинги для UI
 DISPLAY_NAMES = {
-    'pushups_down': 'Push-ups (down)',
-    'pushups_up':   'Push-ups (up)',
-    'squats_down':  'Squats (down)',
-    'squats_up':    'Squats (up)',
+    'squats_down': 'Squats (down)', 'squats_up': 'Squats (up)',
+    'pushups_down': 'Push-ups (down)', 'pushups_up': 'Push-ups (up)'
 }
-
 COLORS = {
-    'pushups_down': (0, 255, 100),
-    'pushups_up':   (0, 255, 100),
-    'squats_down':  (0, 100, 255),
-    'squats_up':    (0, 100, 255),
+    'squats_down': (0, 100, 255), 'squats_up': (0, 100, 255),
+    'pushups_down': (0, 255, 100), 'pushups_up': (0, 255, 100)
 }
+CONNECTIONS = [(11,12),(11,13),(13,15),(12,14),(14,16),(11,23),(12,24),(23,24),
+               (23,25),(25,27),(24,26),(26,28),(27,31),(28,32)]
 
-# ── Соединения скелета ────────────────────────────────────────────────────────
-CONNECTIONS = [
-    (11, 12), (11, 13), (13, 15), (12, 14), (14, 16),
-    (11, 23), (12, 24), (23, 24),
-    (23, 25), (25, 27), (24, 26), (26, 28),
-    (27, 31), (28, 32),
-]
-
-# ── Главный цикл ─────────────────────────────────────────────────────────────
+# Буферы для сглаживания. label_buffer (10 кадров) убирает дребезг классификации.
+# error_buffer (6 кадров) показывает ошибку только если она стабильна в течение ~0.2с.
 cap = cv2.VideoCapture(0)
-prev_features = None
-label, confidence = 'Waiting for pose...', 0.0
+prev_model_feat = None
+prev_knee_angle = None
+label_buffer = deque(maxlen=10)
+error_buffer = deque(maxlen=6)
+current_label = 'Waiting...'
+confidence = 0.0
+timestamp_counter = 0
 
-# Для сглаживания предсказаний — берём среднее по последним N кадрам
-from collections import deque
-prediction_buffer = deque(maxlen=10)
-
-timestamp_counter = 0  # ручной счётчик на случай если CAP_PROP_POS_MSEC = 0
+print("Ready. Press 'q' to exit.")
 
 while cap.isOpened():
     ret, frame = cap.read()
-    if not ret:
-        break
+    if not ret: break
 
     h, w, _ = frame.shape
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
 
-    # Timestamp — используем ручной счётчик чтобы избежать проблем с камерой
-    timestamp_counter += 33  # ~30 fps = 33ms на кадр
+    # timestamp_counter += 33 имитирует ~30 FPS для MediaPipe, что стабилизирует трекинг.
+    timestamp_counter += 33
     result = detector.detect_for_video(mp_image, timestamp_counter)
 
     if result.pose_landmarks:
         lm = result.pose_landmarks[0]
 
-        # Рисуем скелет
-        color = COLORS.get(label, (0, 255, 0))
-        for start_idx, end_idx in CONNECTIONS:
-            x1, y1 = int(lm[start_idx].x * w), int(lm[start_idx].y * h)
-            x2, y2 = int(lm[end_idx].x * w),   int(lm[end_idx].y * h)
-            cv2.line(frame, (x1, y1), (x2, y2), color, 2)
+        color = COLORS.get(current_label, (150, 150, 150))
+        for s, e in CONNECTIONS:
+            cv2.line(frame, (int(lm[s].x*w), int(lm[s].y*h)), (int(lm[e].x*w), int(lm[e].y*h)), color, 2)
+        for p in lm:
+            cv2.circle(frame, (int(p.x*w), int(p.y*h)), 4, (255, 255, 255), -1)
 
-        for point in lm:
-            x, y = int(point.x * w), int(point.y * h)
-            cv2.circle(frame, (x, y), 4, (255, 255, 255), -1)
-
-        # Извлекаем признаки и делаем предсказание
         try:
-            features_dict = extract_features(lm, prev_features)
-            new_label, new_conf = predict_exercise(features_dict)
+            model_feat = extract_features_for_model(lm, prev_model_feat)
+            if model_feat:
+                new_label, new_conf = predict_exercise(model_feat)
+                label_buffer.append(new_label)
+                current_label = Counter(label_buffer).most_common(1)[0][0]
+                confidence = new_conf
+                prev_model_feat = model_feat
 
-            # Буфер сглаживания — берём самое частое предсказание за 10 кадров
-            prediction_buffer.append(new_label)
-            from collections import Counter
-            label = Counter(prediction_buffer).most_common(1)[0][0]
-            confidence = new_conf
+                # Запускаем анализ техники только если модель уверена, что видит присед.
+                if "squats" in current_label:
+                    analysis_feat = extract_features_for_analysis(lm)
+                    if analysis_feat:
+                        raw_errors, prev_knee_angle = detect_errors(
+                            analysis_feat, current_label, ref_stats, prev_knee_angle
+                        )
+                        error_buffer.append(set(raw_errors))
+                    else:
+                        prev_knee_angle = None
+                else:
+                    # При смене упражнения сбрасываем состояние, чтобы ошибки не "висели"
+                    error_buffer.clear()
+                    prev_knee_angle = None
+        except Exception:
+            pass  # Тихо пропускаем сбойные кадры, чтобы не ронять реалтайм-луп
 
-            prev_features = features_dict
-        except Exception as e:
-            pass  # если что-то пошло не так — просто пропускаем кадр
+    # Агрегируем ошибки: показываем только те, что встретились ≥3 раз из последних 6 кадров.
+    # Это фильтрует одиночные выбросы детектора поз.
+    stable_errors = Counter(err for s in error_buffer for err in s)
+    active_errors = [err for err, cnt in stable_errors.items() if cnt >= 3]
 
-    # ── Отрисовка интерфейса ─────────────────────────────────────────────────
-    # Полупрозрачный фон для текста
+    # Рендерим UI поверх кадра с полупрозрачной подложкой для читаемости текста.
     overlay = frame.copy()
-    cv2.rectangle(overlay, (0, 0), (400, 80), (0, 0, 0), -1)
-    cv2.addWeighted(overlay, 0.5, frame, 0.5, 0, frame)
+    cv2.rectangle(overlay, (0, 0), (w, 190), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
 
-    # Название упражнения
-    display_name = DISPLAY_NAMES.get(label, label)
-    text_color   = COLORS.get(label, (0, 255, 0))
-    cv2.putText(frame, display_name, (10, 35),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.8, text_color, 2)
-
-    # Уверенность модели
-    conf_text = f'Confidence: {confidence*100:.0f}%'
-    cv2.putText(frame, conf_text, (10, 62),
+    cv2.putText(frame, DISPLAY_NAMES.get(current_label, current_label), (20, 40),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2)
+    cv2.putText(frame, f"Conf: {confidence*100:.0f}%", (20, 70),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+    cv2.putText(frame, f"Ref: {'ACTIVE' if ref_stats else 'NONE'}", (20, 95),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0) if ref_stats else (0, 100, 255), 1)
 
-    # Полоска уверенности
-    bar_w = int(confidence * 200)
-    cv2.rectangle(frame, (10, 70), (210, 78), (50, 50, 50), -1)
-    cv2.rectangle(frame, (10, 70), (10 + bar_w, 78), text_color, -1)
+    y = 120
+    if active_errors:
+        for err in active_errors:
+            cv2.putText(frame, f"ERROR: {err}", (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 255), 2)
+            y += 30
+    elif "squats" in current_label:
+        cv2.putText(frame, "Good form", (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2)
 
-    cv2.imshow('Exercise Classifier', frame)
+    cv2.imshow('Exercise Analyzer', frame)
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
 

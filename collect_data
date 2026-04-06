@@ -5,7 +5,8 @@ import time
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 
-# ── Настройка MediaPipe ──────────────────────────────────────────────────────
+# Инициализация MediaPipe Pose Landmarker в режиме VIDEO.
+# Режим VIDEO использует трекинг между кадрами — координаты стабильнее, меньше дребезга.
 base_options = python.BaseOptions(model_asset_path='pose_landmarker_full.task')
 options = vision.PoseLandmarkerOptions(
     base_options=base_options,
@@ -14,17 +15,20 @@ options = vision.PoseLandmarkerOptions(
 )
 detector = vision.PoseLandmarker.create_from_options(options)
 
-# ── Настройки записи ─────────────────────────────────────────────────────────
-# Сколько кадров записывать на каждый класс
-FRAMES_PER_CLASS = 150  # ~5 секунд при 30fps
+# Количество кадров для записи одной позы. 150 кадров ≈ 5 секунд при 30 FPS.
+# Для тренировочных данных этого достаточно, чтобы покрыть микро-вариации позы.
+FRAMES_PER_CLASS = 150
 
+# Маппинг клавиш на классы упражнений. Разделяем фазы вниз/вверх для каждого упражнения.
 CLASSES = {
-    '1': 'squats_down',   # нажми 1 когда сидишь внизу
-    '2': 'squats_up',     # нажми 2 когда стоишь прямо после приседания
-    '3': 'pushups_down',  # нажми 3 когда внизу отжимания
-    '4': 'pushups_up',    # нажми 4 когда вверху отжимания
+    '1': 'squats_down',   # Нижняя точка приседа
+    '2': 'squats_up',     # Исходное положение стоя
+    '3': 'pushups_down',  # Нижняя точка отжимания
+    '4': 'pushups_up',    # Верхняя точка отжимания
 }
 
+# Цвета для отрисовки скелета в UI (формат BGR для OpenCV).
+# Приседания — оранжевые, отжимания — зелёные для визуального различия.
 COLORS = {
     'squats_down':  (0, 100, 255),
     'squats_up':    (0, 100, 255),
@@ -32,13 +36,17 @@ COLORS = {
     'pushups_up':   (0, 255, 100),
 }
 
+# Пары индексов ландмарков для отрисовки линий скелета.
+# Выбираем только ключевые соединения, чтобы не перегружать визуал.
 CONNECTIONS = [
-    (11, 12), (11, 13), (13, 15), (12, 14), (14, 16),
-    (11, 23), (12, 24), (23, 24),
-    (23, 25), (25, 27), (24, 26), (26, 28),
-    (27, 31), (28, 32),
+    (11, 12), (11, 13), (13, 15), (12, 14), (14, 16),  # Руки и плечи
+    (11, 23), (12, 24), (23, 24),                       # Торс
+    (23, 25), (25, 27), (24, 26), (26, 28),             # Ноги до лодыжек
+    (27, 31), (28, 32),                                  # Стопы
 ]
 
+# Имена ландмарков в порядке индексов MediaPipe (0–32).
+# Нужны для сохранения координат в CSV с человекочитаемыми колонками.
 LANDMARK_NAMES = [
     'nose','left_eye_inner','left_eye','left_eye_outer',
     'right_eye_inner','right_eye','right_eye_outer',
@@ -51,18 +59,19 @@ LANDMARK_NAMES = [
     'left_foot_index','right_foot_index',
 ]
 
-# ── Сбор данных ───────────────────────────────────────────────────────────────
-all_rows   = []
-pose_id    = 0
-current_class   = None
-recording       = False
-frames_recorded = 0
-countdown       = 0
-countdown_start = 0
+# Состояние скрипта: буфер данных, счётчики, флаги записи
+all_rows = []        # Накопитель строк для будущего DataFrame
+pose_id = 0          # Уникальный идентификатор кадра в датасете
+current_class = None # Какой класс сейчас записываем (None = пауза)
+recording = False    # Флаг активной записи
+frames_recorded = 0  # Счётчик записанных кадров для текущего класса
+countdown = 0        # Оставшиеся секунды до старта записи
+countdown_start = 0  # Время начала отсчёта (для расчёта remaining)
 
-cap = cv2.VideoCapture(0)
-timestamp_counter = 0
+cap = cv2.VideoCapture(0)  # Захват видео с веб-камеры
+timestamp_counter = 0      # Эмуляция таймстемпов для MediaPipe (~33 мс = 30 FPS)
 
+# Вывод инструкции для пользователя
 print('Инструкция:')
 print('  1 — начать запись squats_down  (присядь вниз и держи позу)')
 print('  2 — начать запись squats_up    (встань прямо)')
@@ -73,36 +82,41 @@ print('  Q — выйти')
 print()
 print(f'На каждый класс записывается {FRAMES_PER_CLASS} кадров (~5 сек)')
 
+# Главный цикл обработки видео
 while cap.isOpened():
     ret, frame = cap.read()
     if not ret:
         break
 
     h, w, _ = frame.shape
+    # Конвертируем BGR (OpenCV) в RGB (MediaPipe)
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
 
+    # Инкремент таймстемпа — критично для корректного трекинга в режиме VIDEO
     timestamp_counter += 33
     result = detector.detect_for_video(mp_image, timestamp_counter)
 
-    skeleton_color = (100, 100, 100)  # серый если не записываем
+    skeleton_color = (100, 100, 100)  # Серый цвет, если запись не активна
 
     if result.pose_landmarks:
         lm = result.pose_landmarks[0]
 
-        # Цвет скелета зависит от текущего класса
+        # Если идёт запись — подсвечиваем скелет цветом текущего класса
         if current_class:
             skeleton_color = COLORS.get(current_class, (0, 255, 0))
 
-        # Рисуем скелет
+        # Отрисовка скелета: линии между ключевыми суставами
         for start_idx, end_idx in CONNECTIONS:
             x1, y1 = int(lm[start_idx].x * w), int(lm[start_idx].y * h)
-            x2, y2 = int(lm[end_idx].x * w),   int(lm[end_idx].y * h)
+            x2, y2 = int(lm[end_idx].x * w), int(lm[end_idx].y * h)
             cv2.line(frame, (x1, y1), (x2, y2), skeleton_color, 2)
+
+        # Точки суставов для наглядности
         for point in lm:
             cv2.circle(frame, (int(point.x * w), int(point.y * h)), 4, (255, 255, 255), -1)
 
-        # Обратный отсчёт перед записью
+        # Обратный отсчёт перед стартом записи — даёт пользователю время занять позу
         if countdown > 0:
             elapsed = time.time() - countdown_start
             remaining = countdown - int(elapsed)
@@ -110,40 +124,43 @@ while cap.isOpened():
                 cv2.putText(frame, f'Get ready: {remaining}', (w//2 - 100, h//2),
                             cv2.FONT_HERSHEY_SIMPLEX, 2.0, (0, 255, 255), 3)
             else:
+                # Отсчёт завершён — стартуем запись
                 countdown = 0
                 recording = True
                 frames_recorded = 0
 
-        # Запись кадра
+        # Запись кадра в буфер
         elif recording and current_class:
+            # Формируем строку: ID, класс и координаты всех ландмарков
             row = {'pose_id': pose_id, 'pose': current_class}
             for i, name in enumerate(LANDMARK_NAMES):
                 row[f'x_{name}'] = lm[i].x
                 row[f'y_{name}'] = lm[i].y
-                row[f'z_{name}'] = lm[i].z
+                row[f'z_{name}'] = lm[i].z  # Z — глубина, может пригодиться для 3D-анализа
             all_rows.append(row)
             pose_id += 1
             frames_recorded += 1
 
-            # Прогресс бар
+            # Прогресс-бар внизу кадра — визуальная обратная связь
             progress = int((frames_recorded / FRAMES_PER_CLASS) * (w - 20))
             cv2.rectangle(frame, (10, h-30), (w-10, h-10), (50, 50, 50), -1)
             cv2.rectangle(frame, (10, h-30), (10 + progress, h-10), skeleton_color, -1)
             cv2.putText(frame, f'Recording {current_class}: {frames_recorded}/{FRAMES_PER_CLASS}',
                         (10, h-35), cv2.FONT_HERSHEY_SIMPLEX, 0.6, skeleton_color, 2)
 
+            # Авто-остановка после набора нужного количества кадров
             if frames_recorded >= FRAMES_PER_CLASS:
                 recording = False
                 print(f'Записано {FRAMES_PER_CLASS} кадров для {current_class}')
                 current_class = None
 
-    # ── Интерфейс ─────────────────────────────────────────────────────────────
+    # UI: полупрозрачная подложка для читаемости текста поверх видео
     overlay = frame.copy()
     cv2.rectangle(overlay, (0, 0), (w, 60), (0, 0, 0), -1)
     cv2.addWeighted(overlay, 0.5, frame, 0.5, 0, frame)
 
-    # Статус записанных классов
-    recorded_classes = set(r['pose'] for r in all_rows)
+    # Статус: сколько кадров уже записано по каждому классу
+    # split("_")[0] убирает суффикс _down/_up для компактности в UI
     status_parts = []
     for key, cls in CLASSES.items():
         count = sum(1 for r in all_rows if r['pose'] == cls)
@@ -151,18 +168,21 @@ while cap.isOpened():
     cv2.putText(frame, '  '.join(status_parts), (10, 20),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
 
+    # Подсказка по управлению, если не идёт запись и не активен отсчёт
     if not recording and countdown == 0:
         cv2.putText(frame, 'Press 1-4 to record | S to save | Q to quit',
                     (10, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (150, 150, 150), 1)
-    
+
     cv2.imshow('Data Collector', frame)
+    key = cv2.waitKey(1) & 0xFF  # Ждём нажатие клавиши 1 мс
 
-    key = cv2.waitKey(1) & 0xFF
-
+    # Обработка клавиш
     if key == ord('q'):
+        # Выход из цикла и освобождение ресурсов
         break
 
     elif key == ord('s'):
+        # Сохранение накопленных данных в CSV
         if all_rows:
             df = pd.DataFrame(all_rows)
             df.to_csv(r'Datasets\my_landmarks.csv', index=False)
@@ -171,13 +191,15 @@ while cap.isOpened():
         else:
             print('Нет данных для сохранения')
 
+    # Запуск записи по клавишам 1–4 с 3-секундной задержкой на подготовку
     elif not recording and countdown == 0:
-        cls_key = chr(key) if key < 128 else None
+        cls_key = chr(key) if key < 128 else None  # Защита от не-ASCII клавиш
         if cls_key in CLASSES:
             current_class = CLASSES[cls_key]
             countdown = 3
             countdown_start = time.time()
             print(f'Подготовка к записи: {current_class}...')
 
+# Освобождение ресурсов камеры и закрытие окон
 cap.release()
 cv2.destroyAllWindows()

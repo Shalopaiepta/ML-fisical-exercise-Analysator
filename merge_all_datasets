@@ -1,0 +1,39 @@
+import pandas as pd
+from pathlib import Path
+
+
+
+DATA_DIR = Path("Datasets")
+
+
+original = pd.read_csv(DATA_DIR / "combined_landmarks.csv")   # уже существующий объединённый
+
+print(f"Загружено оригинальных данных: {len(original)} строк")
+
+
+user_files = [
+    DATA_DIR / "my_landmarks.csv",               
+    # DATA_DIR / "my_landmarks_friend1.csv",     
+]
+
+for file in user_files:
+    if file.exists():
+        df = pd.read_csv(file)
+        print(f"Добавлено {len(df)} строк из {file.name}")
+        original = pd.concat([original, df], ignore_index=True)
+    else:
+        print(f"Файл {file.name} не найден — пропускаем")
+
+needed = ['squats_down', 'squats_up', 'pushups_down', 'pushups_up']
+original = original[original['pose'].isin(needed)].reset_index(drop=True)
+
+# Пересчитываем pose_id заново
+original['pose_id'] = original.index
+
+
+print(f"Всего строк: {len(original)}")
+print(original['pose'].value_counts())
+
+
+original.to_csv(DATA_DIR / "final_combined_landmarks.csv", index=False)
+print("\n✅ Финальный датасет сохранён: Datasets/final_combined_landmarks.csv")
