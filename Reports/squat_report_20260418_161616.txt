@@ -1,0 +1,60 @@
+============================================================
+       SQUAT FORM ANALYSIS REPORT
+============================================================
+Date       : 2026-04-18 16:16:16
+Duration   : 34.0 seconds
+Frames     : 368
+
+RESULT: 8 issue(s) detected.
+
+SUMMARY
+----------------------------------------
+  Heels lifting                 65.2%  █████████████
+  Stance width off              53.5%  ██████████
+  Hips shifting                 28.0%  █████
+  Leg asymmetry                 28.0%  █████
+  Leaning at top                26.6%  █████
+  Excessive forward lean        23.4%  ████
+  Not fully extended            12.8%  ██
+  Insufficient depth             8.7%  █
+
+DETAILED BREAKDOWN
+----------------------------------------
+1. Heels lifting  (65.2% of frames)
+   What happened : Your heels came off the floor during the squat.
+   How to fix    : This is typically caused by tight calves or limited ankle mobility. Try calf stretches before squatting, or use heel elevation (small plate under heels) temporarily.
+
+2. Stance width off  (53.5% of frames)
+   What happened : Your foot stance width was inconsistent or outside your normal range.
+   How to fix    : Find a comfortable stance (typically shoulder-width) and stick with it. Marking tape on the floor can help you stay consistent.
+
+3. Hips shifting  (28.0% of frames)
+   What happened : Your hips shifted sideways during the movement.
+   How to fix    : This often signals a hip flexor or glute imbalance. Try single-leg exercises (lunges, Bulgarian split squats) to even things out.
+
+4. Leg asymmetry  (28.0% of frames)
+   What happened : Significant left-right asymmetry was detected in your knee angles.
+   How to fix    : This may indicate a strength or mobility imbalance. Single-leg work and checking for tight hip flexors on one side can help.
+
+5. Leaning at top  (26.6% of frames)
+   What happened : You leaned forward at the top of the squat instead of standing upright.
+   How to fix    : Focus on driving your hips forward at lockout. Glute bridges and hip thrusts can reinforce this pattern.
+
+6. Excessive forward lean  (23.4% of frames)
+   What happened : Your torso leaned too far forward during the descent.
+   How to fix    : Work on ankle mobility and keep your chest up. Try box squats to practice an upright torso.
+
+7. Not fully extended  (12.8% of frames)
+   What happened : You did not fully extend your knees at the top of the movement.
+   How to fix    : Make sure to stand all the way up at the top. Squeeze your glutes at the top to ensure full lockout.
+
+8. Insufficient depth  (8.7% of frames)
+   What happened : Your squat depth was too shallow.
+   How to fix    : Try to lower your hips until your thighs are at least parallel to the floor. Think about sitting back and down into a chair.
+
+PRIORITY
+----------------------------------------
+Focus on "Heels lifting" first — it appeared 65.2% of the time.
+This is typically caused by tight calves or limited ankle mobility. Try calf stretches before squatting, or use heel elevation (small plate under heels) temporarily.
+
+============================================================

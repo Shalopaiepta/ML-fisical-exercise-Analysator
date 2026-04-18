@@ -8,10 +8,11 @@ from xgboost import XGBClassifier
 import warnings
 warnings.filterwarnings('ignore')
 
-print("=== ЗАГРУЗКА И ПОДГОТОВКА ===")
+# Загружаем объединённый датасет с сырыми координатами ландмарков
 combined = pd.read_csv(r'Datasets\combined_landmarks.csv')
 
-# Явный список ландмарков — защита от "мусорных" колонок
+# Явно перечисляем используемые ландмарки — защита от случайных колонок в CSV
+# Если в файле появится мусор (например, 'confidence'), он не сломает нормализацию
 LANDMARKS = [
     'nose', 'left_shoulder', 'right_shoulder', 'left_elbow', 'right_elbow',
     'left_wrist', 'right_wrist', 'left_hip', 'right_hip', 'left_knee', 'right_knee',
@@ -19,16 +20,18 @@ LANDMARKS = [
 ]
 
 def normalize_pose_safe(row, landmarks):
+    """Нормализует координаты относительно центра таза и масштаба торса.
+    
+    Зачем: делает признаки инвариантными к дистанции до камеры, росту человека и кропу кадра.
+    Возвращает dict с нормализованными координатами только для указанных ландмарков.
     """
-    Безопасная нормализация: относительно центра таза и масштаба тела.
-    Возвращает dict с нормализованными x_/y_ координатами ТОЛЬКО для указанных ландмарков.
-    """
-    # Центры
+    # Центр таза — точка отсчёта для нормализации
     l_hip = np.array([row[f'x_left_hip'], row[f'y_left_hip']])
     r_hip = np.array([row[f'x_right_hip'], row[f'y_right_hip']])
     center = (l_hip + r_hip) / 2
     
-    # Масштаб: расстояние между плечами и тазом
+    # Масштаб тела: расстояние между центром плеч и центром таза
+    # +1e-6 защищает от деления на ноль, если детектор потерял позу
     l_sh = np.array([row[f'x_left_shoulder'], row[f'y_left_shoulder']])
     r_sh = np.array([row[f'x_right_shoulder'], row[f'y_right_shoulder']])
     body_scale = np.linalg.norm((l_sh + r_sh)/2 - center) + 1e-6
@@ -39,14 +42,18 @@ def normalize_pose_safe(row, landmarks):
             col = f'{prefix}{lm}'
             if col in row and not pd.isna(row[col]):
                 raw = row[col]
-                # Нормализация: (значение - центр) / масштаб
+                # Формула: (координата - центр) / масштаб
                 normalized[col] = (raw - center[0 if axis=='x' else 1]) / body_scale
             else:
-                normalized[col] = np.nan  # Явно помечаем пропуски
+                normalized[col] = np.nan  # Явно помечаем пропуски для последующей обработки
     return normalized
 
 def calculate_angle(a, b, c):
-    """Стабильный расчёт угла в градусах между векторами ba и bc"""
+    """Считает угол в точке b между векторами ba и bc через скалярное произведение.
+    
+    Возвращает градусы. Эпсилон и clip() защищают от деления на ноль и math domain error
+    при коллинеарных векторах или шумных координатах от детектора поз.
+    """
     ba = np.array(a) - np.array(b)
     bc = np.array(c) - np.array(b)
     norm_ba = np.linalg.norm(ba)
@@ -57,23 +64,25 @@ def calculate_angle(a, b, c):
     return np.degrees(np.arccos(np.clip(cos_angle, -1.0, 1.0)))
 
 def extract_features(row, prev_features=None):
-    """
-    Извлечение признаков для ОДНОЙ строки.
-    Идентичная логика для обучения и inference.
+    """Извлекает признаки для одной строки датасета.
+    
+    Критично: логика должна быть идентична inference-скрипту, иначе модель получит
+    признаки в другом порядке/масштабе и предсказания станут бессмысленными.
     """
     f = {}
     
-    # 1. Нормализованные координаты
+    # Нормализованные координаты — база для всех геометрических вычислений
     norm = normalize_pose_safe(row, LANDMARKS)
     
-    # Проверка на критические пропуски
+    # Если потеряны критические точки (нос, бёдра) — пропускаем кадр
     if any(pd.isna(norm.get(f'x_{lm}', np.nan)) for lm in ['nose', 'left_hip', 'right_hip']):
         return None
     
+    # Удобный хелпер для доступа к нормализованным координатам
     def p(name):
         return np.array([norm[f'x_{name}'], norm[f'y_{name}']])
     
-    # 2. Ключевые точки
+    # Ключевые точки тела в нормализованной системе координат
     l_sh, r_sh = p('left_shoulder'), p('right_shoulder')
     l_hip, r_hip = p('left_hip'), p('right_hip')
     l_kn, r_kn = p('left_knee'), p('right_knee')
@@ -85,14 +94,16 @@ def extract_features(row, prev_features=None):
     mid_sh = (l_sh + r_sh) / 2
     mid_hip = (l_hip + r_hip) / 2
     
-    # 3. === КЛЮЧЕВЫЕ: ориентация тела (решает squats vs pushups) ===
-    f['body_verticality'] = abs(mid_sh[1] - mid_hip[1])  # ΔY: вертикальный компонент
-    f['body_horizontal'] = abs(mid_sh[0] - mid_hip[0])    # ΔX: горизонтальный компонент
+    # Ориентация тела: главный признак, отделяющий вертикальные позы (присед) от горизонтальных (отжимание)
+    f['body_verticality'] = abs(mid_sh[1] - mid_hip[1])  # ΔY: вертикальная составляющая
+    f['body_horizontal'] = abs(mid_sh[0] - mid_hip[0])    # ΔX: горизонтальная составляющая
     f['orientation_ratio'] = f['body_verticality'] / (f['body_horizontal'] + 1e-6)  # >2 = вертикально
+    
+    # Аспект-райт бокса тела: высота/ширина. Ещё один надёжный дискриминатор поз
     f['bbox_aspect'] = (max(p(lm)[1] for lm in LANDMARKS) - min(p(lm)[1] for lm in LANDMARKS) + 1e-6) / \
                        (max(p(lm)[0] for lm in LANDMARKS) - min(p(lm)[0] for lm in LANDMARKS) + 1e-6)
     
-    # 4. === Углы: ОБЕ стороны + симметрии ===
+    # Углы в суставах: считаем для обеих сторон, чтобы детектировать асимметрию
     f['left_knee_angle'] = calculate_angle(l_hip, l_kn, l_an)
     f['right_knee_angle'] = calculate_angle(r_hip, r_kn, r_an)
     f['knee_symmetry'] = abs(f['left_knee_angle'] - f['right_knee_angle'])
@@ -108,15 +119,16 @@ def extract_features(row, prev_features=None):
     f['left_shoulder_angle'] = calculate_angle(l_el, l_sh, l_hip)
     f['right_shoulder_angle'] = calculate_angle(r_el, r_sh, r_hip)
     
-    # 5. === Дополнительные признаки ===
+    # Дополнительные геометрические метрики
     f['trunk_lean'] = np.degrees(np.arctan2(
-        abs(mid_sh[0] - mid_hip[0]), abs(mid_sh[1] - mid_hip[1]) + 1e-6))
-    f['shoulder_width'] = np.linalg.norm(l_sh - r_sh)
-    f['feet_width'] = np.linalg.norm(l_an - r_an)
-    f['height_ratio'] = np.linalg.norm(mid_sh - mid_hip) / (f['shoulder_width'] + 1e-6)
-    f['hip_height'] = mid_hip[1] - mid_sh[1]  # отрицательное = бёдра ниже плеч
+        abs(mid_sh[0] - mid_hip[0]), abs(mid_sh[1] - mid_hip[1]) + 1e-6))  # Наклон корпуса
+    f['shoulder_width'] = np.linalg.norm(l_sh - r_sh)  # Ширина плеч в нормализованных единицах
+    f['feet_width'] = np.linalg.norm(l_an - r_an)  # Ширина стойки
+    f['height_ratio'] = np.linalg.norm(mid_sh - mid_hip) / (f['shoulder_width'] + 1e-6)  # Пропорция торса
+    f['hip_height'] = mid_hip[1] - mid_sh[1]  # Отрицательное = бёдра ниже плеч (присед)
     
-    # 6. === Velocity-фичи (только если есть prev) ===
+    # Velocity-фичи: скорость изменения углов между кадрами
+    # Помогают модели различать фазы движения (опускание/подъём) и отсекать статичные позы
     vel_cols = ['left_knee_angle', 'right_knee_angle', 'left_hip_angle', 'right_hip_angle',
                 'left_elbow_angle', 'right_elbow_angle', 'trunk_lean', 'hip_height',
                 'body_verticality', 'orientation_ratio']
@@ -125,23 +137,22 @@ def extract_features(row, prev_features=None):
         if prev_features and col in prev_features:
             f[f'vel_{col}'] = f[col] - prev_features[col]
         else:
-            f[f'vel_{col}'] = 0.0
+            f[f'vel_{col}'] = 0.0  # Первый кадр или пропуск: скорость = 0
     
     return f
 
-# ================= ИЗВЛЕЧЕНИЕ ПРИЗНАКОВ =================
-print("=== ИЗВЛЕЧЕНИЕ ПРИЗНАКОВ ===")
+# Проходим по всему датасету и извлекаем признаки построчно
 features_list = []
-prev_feat = None
+prev_feat = None  # Храним признаки предыдущего кадра для расчёта velocity
 
 for idx, row in combined.iterrows():
     feat = extract_features(row, prev_feat)
     if feat is None:
-        prev_feat = None  # сброс при пропуске
+        prev_feat = None  # Сбрасываем историю при пропуске, чтобы velocity не "утёк" между упражнениями
         continue
-    feat['pose'] = row['pose']
+    feat['pose'] = row['pose']  # Возвращаем целевую переменную
     features_list.append(feat)
-    prev_feat = feat.copy()  # для velocity следующего кадра
+    prev_feat = feat.copy()  # Копируем, чтобы избежать побочных эффектов при модификации
 
 if not features_list:
     raise ValueError("Не извлечено ни одного признака! Проверьте данные.")
@@ -149,45 +160,48 @@ if not features_list:
 features_df = pd.DataFrame(features_list)
 print(f"Извлечено {len(features_df)} строк, {len(features_df.columns)-1} признаков")
 
-# Проверка пропусков
+# Заполняем пропуски медианой — безопаснее среднего при выбросах в углах
 if features_df.isnull().any().any():
     print(f"⚠️ Пропуски: {features_df.isnull().sum().sum()} значений. Заполняем медианой.")
     features_df = features_df.fillna(features_df.median(numeric_only=True))
 
-# ================= ПОДГОТОВКА К ОБУЧЕНИЮ =================
+# Разделяем признаки и целевую переменную
 X = features_df.drop('pose', axis=1)
 y = features_df['pose']
 
+# Кодируем строковые метки классов в числа для XGBoost
 le = LabelEncoder()
 y_enc = le.fit_transform(y)
 
+# Стандартизируем признаки: важно для градиентного бустинга и интерпретации весов
 scaler = StandardScaler()
 X_scaled = scaler.fit_transform(X)
 
-# Стратифицированный split
+# Стратифицированный split: сохраняем распределение классов в трейне и тесте
+# random_state=42 для воспроизводимости результатов
 X_train, X_test, y_train, y_test = train_test_split(
     X_scaled, y_enc, test_size=0.2, random_state=42, stratify=y_enc
 )
 
-# ================= ОБУЧЕНИЕ МОДЕЛИ =================
-print("=== ОБУЧЕНИЕ МОДЕЛИ ===")
+# Настраиваем XGBoost: гиперпараметры подобраны для баланса между точностью и переобучением
+
 model = XGBClassifier(
-    n_estimators=600,
-    max_depth=7,
-    learning_rate=0.04,
-    subsample=0.85,
-    colsample_bytree=0.85,
-    min_child_weight=3,          # защита от шума
-    random_state=42,
-    eval_metric='mlogloss',
-    early_stopping_rounds=70,
-    n_jobs=-1,
-    use_label_encoder=False
+    n_estimators=600,        # Достаточно деревьев для сложных границ, но не перебор
+    max_depth=7,             # Ограничиваем глубину — снижает риск переобучения на шумных данных
+    learning_rate=0.04,      # Медленный темп обучения требует больше деревьев, но даёт стабильность
+    subsample=0.85,          # Сэмплирование строк — регуляризация через стохастичность
+    colsample_bytree=0.85,   # Сэмплирование признаков — снижает корреляцию между деревьями
+    min_child_weight=3,      # Минимальная сумма весов в листе — защита от шума
+    random_state=42,         # Фиксируем случайность для воспроизводимости
+    eval_metric='mlogloss',  # Метрика для early stopping при мультиклассовой задаче
+    early_stopping_rounds=70,# Останавливаем обучение, если тест не улучшается 70 эпох подряд
+    n_jobs=-1,               # Используем все ядра для ускорения
+    use_label_encoder=False  # Предупреждение: LabelEncoder уже применён вручную
 )
 
 model.fit(X_train, y_train, eval_set=[(X_test, y_test)], verbose=False)
 
-# ================= ОЦЕНКА =================
+# Оцениваем качество на тесте
 y_pred = model.predict(X_test)
 acc = accuracy_score(y_test, y_pred)
 
@@ -196,7 +210,7 @@ print(f'Accuracy: {acc*100:.2f}%')
 print(f'Confusion Matrix:\n{confusion_matrix(y_test, y_pred)}')
 print(f'\nClassification Report:\n{classification_report(y_test, y_pred, target_names=le.classes_)}')
 
-# Feature importance
+# Анализируем важность признаков: помогает понять, что реально работает в модели
 importances = pd.DataFrame({
     'feature': X.columns,
     'importance': model.feature_importances_
@@ -205,16 +219,17 @@ importances = pd.DataFrame({
 print(f"\nТоп-10 признаков:")
 print(importances.head(10).to_string(index=False))
 
-# ================= СОХРАНЕНИЕ =================
+# Сохраняем все артефакты для inference
+# Порядок колонок (feature_order) критичен: без него модель получит признаки не в том порядке
 joblib.dump(model, 'exercise_classifier_final.pkl')
 joblib.dump(scaler, 'angle_scaler_final.pkl')
 joblib.dump(le, 'label_encoder_final.pkl')
-joblib.dump(list(X.columns), 'feature_order.pkl')  # Критично для inference!
-joblib.dump(LANDMARKS, 'landmarks_list.pkl')        # Для безопасной нормализации
+joblib.dump(list(X.columns), 'feature_order.pkl')
+joblib.dump(LANDMARKS, 'landmarks_list.pkl')  # Для безопасной нормализации в продакшене
 
-print('\n✅ Сохранено:')
+print('\nСохранено:')
 print('   exercise_classifier_final.pkl')
 print('   angle_scaler_final.pkl')
 print('   label_encoder_final.pkl')
-print('   feature_order.pkl  ← порядок фичей')
+print('   feature_order.pkl  ← порядок фичей (критично!)')
 print('   landmarks_list.pkl ← список ландмарков')
