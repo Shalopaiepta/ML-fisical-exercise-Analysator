@@ -9,6 +9,11 @@ from collections import deque, Counter
 from datetime import datetime
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
+from error_detection import (
+    detect_errors,
+    extract_features_for_analysis as shared_extract_features_for_analysis,
+    spine_angle_3d,
+)
 
 # ── Загрузка артефактов ──────────────────────────────────────────────────────
 model        = joblib.load('exercise_classifier_final.pkl')
@@ -37,178 +42,7 @@ for phase in ['squats_down', 'squats_up']:
 if not ref_stats:
     print("Warning: Reference files not found. Form analysis disabled.")
 
-# ── MediaPipe ────────────────────────────────────────────────────────────────
-base_options = python.BaseOptions(model_asset_path='pose_landmarker_full.task')
-options = vision.PoseLandmarkerOptions(
-    base_options=base_options,
-    output_segmentation_masks=False,
-    running_mode=vision.RunningMode.VIDEO,
-)
-detector = vision.PoseLandmarker.create_from_options(options)
 
-# ── Утилиты ──────────────────────────────────────────────────────────────────
-def calculate_angle(a, b, c):
-    ba = np.array(a) - np.array(b)
-    bc = np.array(c) - np.array(b)
-    n1, n2 = np.linalg.norm(ba), np.linalg.norm(bc)
-    if n1 * n2 < 1e-8:
-        return 0.0
-    return np.degrees(np.arccos(np.clip(np.dot(ba, bc) / (n1 * n2), -1.0, 1.0)))
-
-def get_coords(lm):
-    idx_map = {
-        'nose': 0, 'left_shoulder': 11, 'right_shoulder': 12,
-        'left_elbow': 13, 'right_elbow': 14, 'left_wrist': 15, 'right_wrist': 16,
-        'left_hip': 23, 'right_hip': 24, 'left_knee': 25, 'right_knee': 26,
-        'left_ankle': 27, 'right_ankle': 28, 'left_heel': 29, 'right_heel': 30,
-        'left_foot_index': 31, 'right_foot_index': 32,
-    }
-    coords = {}
-    for name, idx in idx_map.items():
-        coords[name] = np.array([lm[idx].x, lm[idx].y]) if idx < len(lm) else np.array([np.nan, np.nan])
-    return coords
-
-def normalize(coords):
-    """Возвращает функцию n(key) -> нормализованная точка и scale."""
-    l_hip, r_hip = coords['left_hip'], coords['right_hip']
-    center = (l_hip + r_hip) / 2
-    l_sh, r_sh = coords['left_shoulder'], coords['right_shoulder']
-    scale = np.linalg.norm((l_sh + r_sh) / 2 - center) + 1e-6
-    def n(key):
-        return (coords[key] - center) / scale
-    return n, scale
-
-def extract_features_for_model(lm, prev=None):
-    f = {}
-    c = get_coords(lm)
-    if any(np.isnan(c[k]).any() for k in ['nose', 'left_hip', 'right_hip']):
-        return None
-    n, _ = normalize(c)
-
-    mid_sh  = (n('left_shoulder') + n('right_shoulder')) / 2
-    mid_hip = (n('left_hip')      + n('right_hip'))      / 2
-    nose    = n('nose')
-
-    f['left_elbow_angle']     = calculate_angle(n('left_shoulder'),  n('left_elbow'),  n('left_wrist'))
-    f['right_elbow_angle']    = calculate_angle(n('right_shoulder'), n('right_elbow'), n('right_wrist'))
-    f['left_shoulder_angle']  = calculate_angle(n('left_elbow'),     n('left_shoulder'),  n('left_hip'))
-    f['right_shoulder_angle'] = calculate_angle(n('right_elbow'),    n('right_shoulder'), n('right_hip'))
-    f['left_knee_angle']      = calculate_angle(n('left_hip'),  n('left_knee'),  n('left_ankle'))
-    f['right_knee_angle']     = calculate_angle(n('right_hip'), n('right_knee'), n('right_ankle'))
-    f['left_hip_angle']       = calculate_angle(n('left_shoulder'),  n('left_hip'),  n('left_knee'))
-    f['right_hip_angle']      = calculate_angle(n('right_shoulder'), n('right_hip'), n('right_knee'))
-    f['left_ankle_angle']     = calculate_angle(n('left_knee'),  n('left_ankle'),  n('left_foot_index'))
-    f['right_ankle_angle']    = calculate_angle(n('right_knee'), n('right_ankle'), n('right_foot_index'))
-
-    f['trunk_lean']  = np.degrees(np.arctan2(abs(mid_sh[0]-mid_hip[0]), abs(mid_sh[1]-mid_hip[1])+1e-6))
-    f['head_tilt']   = np.degrees(np.arctan2(abs(nose[0]-mid_sh[0]),    abs(nose[1]-mid_sh[1])+1e-6))
-    f['body_verticality']  = abs(mid_sh[1] - mid_hip[1])
-    f['body_horizontal']   = abs(mid_sh[0] - mid_hip[0])
-    f['orientation_ratio'] = f['body_verticality'] / (f['body_horizontal'] + 1e-6)
-
-    all_pts = [n(k) for k in c if not np.isnan(c[k]).any()]
-    all_y   = [p[1] for p in all_pts]
-    all_x   = [p[0] for p in all_pts]
-    f['bbox_aspect'] = (max(all_y)-min(all_y)+1e-6) / (max(all_x)-min(all_x)+1e-6)
-
-    f['knee_symmetry']     = abs(f['left_knee_angle']     - f['right_knee_angle'])
-    f['elbow_symmetry']    = abs(f['left_elbow_angle']    - f['right_elbow_angle'])
-    f['shoulder_symmetry'] = abs(f['left_shoulder_angle'] - f['right_shoulder_angle'])
-    f['hip_symmetry']      = abs(f['left_hip_angle']      - f['right_hip_angle'])
-    f['feet_width']             = np.linalg.norm(n('left_ankle') - n('right_ankle'))
-    f['shoulder_width']         = np.linalg.norm(n('left_shoulder') - n('right_shoulder'))
-    f['feet_to_shoulder_ratio'] = f['feet_width'] / (f['shoulder_width'] + 1e-6)
-    f['hip_height']    = mid_hip[1] - mid_sh[1]
-    f['height_ratio']  = np.linalg.norm(mid_sh - mid_hip) / (f['shoulder_width'] + 1e-6)
-
-    vel_cols = ['left_elbow_angle','right_elbow_angle','left_shoulder_angle','right_shoulder_angle',
-                'left_knee_angle','right_knee_angle','left_hip_angle','right_hip_angle',
-                'trunk_lean','hip_height']
-    for col in vel_cols:
-        f[f'vel_{col}'] = (f[col] - prev[col]) if prev and col in prev else 0.0
-
-    return f
-
-def extract_features_for_analysis(lm):
-    c = get_coords(lm)
-    if any(np.isnan(c[k]).any() for k in ['left_hip', 'right_hip']):
-        return None
-    n, _ = normalize(c)
-
-    mid_sh  = (n('left_shoulder') + n('right_shoulder')) / 2
-    mid_hip = (n('left_hip')      + n('right_hip'))      / 2
-
-    return {
-        'avg_knee_angle': (
-            calculate_angle(n('left_hip'),  n('left_knee'),  n('left_ankle')) +
-            calculate_angle(n('right_hip'), n('right_knee'), n('right_ankle'))
-        ) / 2,
-        'avg_shoulder_angle': (
-            calculate_angle(n('left_elbow'),  n('left_shoulder'),  n('left_hip')) +
-            calculate_angle(n('right_elbow'), n('right_shoulder'), n('right_hip'))
-        ) / 2,
-        'trunk_lean': np.degrees(np.arctan2(
-            abs(mid_sh[0]-mid_hip[0]), abs(mid_sh[1]-mid_hip[1])+1e-6)),
-        'stance_ratio': np.linalg.norm(n('left_ankle')-n('right_ankle')) /
-                        (np.linalg.norm(n('left_shoulder')-n('right_shoulder'))+1e-6),
-        'hip_shoulder_offset': abs(
-            (n('left_hip')[0]+n('right_hip')[0])/2 -
-            (n('left_shoulder')[0]+n('right_shoulder')[0])/2),
-        'knee_symmetry': abs(
-            calculate_angle(n('left_hip'),  n('left_knee'),  n('left_ankle')) -
-            calculate_angle(n('right_hip'), n('right_knee'), n('right_ankle'))),
-        'left_heel_lift':  c['left_heel'][1]  - c['left_foot_index'][1],
-        'right_heel_lift': c['right_heel'][1] - c['right_foot_index'][1],
-    }
-
-def predict_exercise(feat_dict):
-    col_order = scaler.feature_names_in_ if hasattr(scaler, 'feature_names_in_') else feature_order
-    X = pd.DataFrame([{k: feat_dict.get(k, 0.0) for k in col_order}])
-    X_sc = scaler.transform(X)
-    pred  = model.predict(X_sc)[0]
-    proba = model.predict_proba(X_sc)[0]
-    return le.inverse_transform([pred])[0], float(proba[pred])
-
-def detect_errors(analysis_feat, phase, ref_data, prev_knee_angle):
-    errors = []
-    new_knee_angle = prev_knee_angle
-    if not analysis_feat or phase not in ref_data:
-        return errors, new_knee_angle
-
-    stats = ref_data[phase]
-    current_knee  = analysis_feat.get('avg_knee_angle', 0)
-    new_knee_angle = current_knee
-
-    is_stable = prev_knee_angle is None or abs(current_knee - prev_knee_angle) <= 8.0
-
-    def check(key, desc, condition):
-        if key not in stats or key not in analysis_feat:
-            return
-        val, m, s = analysis_feat[key], stats[key]['mean'], stats[key]['std']
-        if condition(val, m, s):
-            errors.append(desc)
-
-    if phase == 'squats_down':
-        if (analysis_feat.get('left_heel_lift', 0) < -0.02 or
-                analysis_feat.get('right_heel_lift', 0) < -0.02):
-            errors.append("Heels lifting")
-
-    if is_stable:
-        if phase == 'squats_down':
-            check('avg_knee_angle', 'Insufficient depth',      lambda v, m, s: v > m + 1.0*s)
-            check('trunk_lean',     'Excessive forward lean',  lambda v, m, s: v > m + 1.5*s)
-        elif phase == 'squats_up':
-            check('avg_knee_angle',      'Not fully extended',  lambda v, m, s: v < m - 1.5*s)
-            check('avg_shoulder_angle',  'Rounded upper back',  lambda v, m, s: v < m - 1.0*s)
-            check('hip_shoulder_offset', 'Hips shifting',       lambda v, m, s: v > m + 1.5*s)
-            check('trunk_lean',          'Leaning at top',      lambda v, m, s: v > m + 1.0*s)
-
-        check('stance_ratio',   'Stance width off', lambda v, m, s: abs(v-m) > 1.5*s)
-        check('knee_symmetry',  'Leg asymmetry',    lambda v, m, s: v > m + 1.5*s)
-
-    return errors, new_knee_angle
-
-# ── Генерация текстового отчёта ───────────────────────────────────────────────
 ERROR_DESCRIPTIONS = {
     'Insufficient depth': (
         'Глубина приседания недостаточна.',
@@ -225,9 +59,10 @@ ERROR_DESCRIPTIONS = {
         'Вставайте до конца в верхней точке каждого повторения. '
         'Сжимайте ягодицы в верхней точке для полного выпрямления.'
     ),
-    'Rounded upper back': (
-        'Верхняя часть спины округляется в верхней точке.',
+    'Rounded back': (
+        'Спина округляется — обнаружен горб.',
         'Держите грудь высоко, сводите лопатки вместе. '
+        'Следите за тем чтобы уши находились над плечами, а не впереди них. '
         'Упражнения на верхнюю спину (тяги, подтягивания) помогут исправить это.'
     ),
     'Hips shifting': (
@@ -255,15 +90,233 @@ ERROR_DESCRIPTIONS = {
         'Причина — недостаточная подвижность голеностопа или тугие икры. '
         'Растягивайте икроножные мышцы перед тренировкой или временно используйте подпятник.'
     ),
+    'Knee valgus (left)': (
+        'Левое колено заваливается вовнутрь.',
+        'Толкайте колено наружу — в сторону мизинца стопы. '
+        'Ягодичный мостик с резинкой укрепит отводящие мышцы.'
+    ),
+    'Knee valgus (right)': (
+        'Правое колено заваливается вовнутрь.',
+        'Толкайте колено наружу — в сторону мизинца стопы. '
+        'Ягодичный мостик с резинкой укрепит отводящие мышцы.'
+    ),
+    'Knees too wide': (
+        'Колени разводятся слишком широко.',
+        'Удерживайте колени над средним пальцем стопы на протяжении всего движения.'
+    ),
+    'Knees caving in': (
+        'Оба колена сводятся вовнутрь.',
+        'Представьте что хотите разорвать пол между ногами — активирует отводящие мышцы.'
+    ),
+    'Lumbar hyperextension': (
+        'Чрезмерный прогиб поясницы или откидывание таза назад.',
+        'Сохраняйте нейтральное положение поясницы. '
+        'Напрягайте пресс на протяжении всего движения.'
+    ),
 }
+# ── MediaPipe ────────────────────────────────────────────────────────────────
+base_options = python.BaseOptions(model_asset_path='pose_landmarker_full.task')
+options = vision.PoseLandmarkerOptions(
+    base_options=base_options,
+    output_segmentation_masks=False,
+    running_mode=vision.RunningMode.VIDEO,
+)
+detector = vision.PoseLandmarker.create_from_options(options)
+
+# ── Утилиты ──────────────────────────────────────────────────────────────────
+def calculate_angle(a, b, c):
+    """Угол в точке b между векторами ba и bc. Возвращает градусы."""
+    ba = np.array(a) - np.array(b)
+    bc = np.array(c) - np.array(b)
+    n1, n2 = np.linalg.norm(ba), np.linalg.norm(bc)
+    if n1 * n2 < 1e-8:
+        return 0.0
+    return np.degrees(np.arccos(np.clip(np.dot(ba, bc) / (n1 * n2), -1.0, 1.0)))
+
+def get_coords(lm):
+    """
+    Возвращает координаты ключевых точек.
+    Используем x, y, z — MediaPipe даёт все три оси.
+    z — относительная глубина (ненадёжна как самостоятельный признак,
+    но используется внутри calculate_angle для 3D-угла позвоночника).
+    """
+    idx_map = {
+        'nose': 0,
+        'left_ear': 7, 'right_ear': 8,          # ← нужны для spine_angle
+        'left_shoulder': 11, 'right_shoulder': 12,
+        'left_elbow': 13, 'right_elbow': 14,
+        'left_wrist': 15, 'right_wrist': 16,
+        'left_hip': 23, 'right_hip': 24,
+        'left_knee': 25, 'right_knee': 26,
+        'left_ankle': 27, 'right_ankle': 28,
+        'left_heel': 29, 'right_heel': 30,
+        'left_foot_index': 31, 'right_foot_index': 32,
+    }
+    coords = {}
+    for name, idx in idx_map.items():
+        if idx < len(lm):
+            # Храним все три координаты — нужны для 3D угла позвоночника
+            coords[name] = np.array([lm[idx].x, lm[idx].y, lm[idx].z])
+        else:
+            coords[name] = np.array([np.nan, np.nan, np.nan])
+    return coords
+
+def normalize(coords):
+    """
+    Нормализация относительно центра таза и масштаба торса.
+    Работает только с x, y — для инвариантности к дистанции от камеры.
+    """
+    l_hip, r_hip = coords['left_hip'][:2], coords['right_hip'][:2]
+    center = (l_hip + r_hip) / 2
+    l_sh, r_sh = coords['left_shoulder'][:2], coords['right_shoulder'][:2]
+    scale = np.linalg.norm((l_sh + r_sh) / 2 - center) + 1e-6
+
+    def n(key):
+        return (coords[key][:2] - center) / scale
+
+    return n, scale
+
+def extract_features_for_model(lm, prev=None):
+    """Признаки для ML-классификатора упражнений. Не трогаем — модель обучена на них."""
+    f = {}
+    c = get_coords(lm)
+    if any(np.isnan(c[k]).any() for k in ['nose', 'left_hip', 'right_hip']):
+        return None
+    n, _ = normalize(c)
+
+    mid_sh  = (n('left_shoulder') + n('right_shoulder')) / 2
+    mid_hip = (n('left_hip')      + n('right_hip'))      / 2
+    nose    = n('nose')
+
+    f['left_elbow_angle']     = calculate_angle(n('left_shoulder'),  n('left_elbow'),  n('left_wrist'))
+    f['right_elbow_angle']    = calculate_angle(n('right_shoulder'), n('right_elbow'), n('right_wrist'))
+    f['left_shoulder_angle']  = calculate_angle(n('left_elbow'),     n('left_shoulder'),  n('left_hip'))
+    f['right_shoulder_angle'] = calculate_angle(n('right_elbow'),    n('right_shoulder'), n('right_hip'))
+    f['left_knee_angle']      = calculate_angle(n('left_hip'),  n('left_knee'),  n('left_ankle'))
+    f['right_knee_angle']     = calculate_angle(n('right_hip'), n('right_knee'), n('right_ankle'))
+    f['left_hip_angle']       = calculate_angle(n('left_shoulder'),  n('left_hip'),  n('left_knee'))
+    f['right_hip_angle']      = calculate_angle(n('right_shoulder'), n('right_hip'), n('right_knee'))
+    f['left_ankle_angle']     = calculate_angle(n('left_knee'),  n('left_ankle'),  n('left_foot_index'))
+    f['right_ankle_angle']    = calculate_angle(n('right_knee'), n('right_ankle'), n('right_foot_index'))
+
+    f['trunk_lean']  = np.degrees(np.arctan2(abs(mid_sh[0]-mid_hip[0]), abs(mid_sh[1]-mid_hip[1])+1e-6))
+    f['head_tilt']   = np.degrees(np.arctan2(abs(nose[0]-mid_sh[0]),    abs(nose[1]-mid_sh[1])+1e-6))
+    f['body_verticality']  = abs(mid_sh[1] - mid_hip[1])
+    f['body_horizontal']   = abs(mid_sh[0] - mid_hip[0])
+    f['orientation_ratio'] = f['body_verticality'] / (f['body_horizontal'] + 1e-6)
+
+    model_landmarks = [
+        'nose', 'left_shoulder', 'right_shoulder', 'left_elbow', 'right_elbow',
+        'left_wrist', 'right_wrist', 'left_hip', 'right_hip', 'left_knee',
+        'right_knee', 'left_ankle', 'right_ankle', 'left_foot_index', 'right_foot_index',
+    ]
+    all_pts = [n(k) for k in model_landmarks if k in c and not np.isnan(c[k]).any()]
+    all_y   = [p[1] for p in all_pts]
+    all_x   = [p[0] for p in all_pts]
+    f['bbox_aspect'] = (max(all_y)-min(all_y)+1e-6) / (max(all_x)-min(all_x)+1e-6)
+
+    f['knee_symmetry']     = abs(f['left_knee_angle']     - f['right_knee_angle'])
+    f['elbow_symmetry']    = abs(f['left_elbow_angle']    - f['right_elbow_angle'])
+    f['shoulder_symmetry'] = abs(f['left_shoulder_angle'] - f['right_shoulder_angle'])
+    f['hip_symmetry']      = abs(f['left_hip_angle']      - f['right_hip_angle'])
+    f['feet_width']             = np.linalg.norm(n('left_ankle') - n('right_ankle'))
+    f['shoulder_width']         = np.linalg.norm(n('left_shoulder') - n('right_shoulder'))
+    f['feet_to_shoulder_ratio'] = f['feet_width'] / (f['shoulder_width'] + 1e-6)
+    f['hip_height']    = mid_hip[1] - mid_sh[1]
+    f['height_ratio']  = np.linalg.norm(mid_sh - mid_hip) / (f['shoulder_width'] + 1e-6)
+
+    vel_cols = ['left_elbow_angle','right_elbow_angle','left_shoulder_angle','right_shoulder_angle',
+                'left_knee_angle','right_knee_angle','left_hip_angle','right_hip_angle',
+                'trunk_lean','hip_height']
+    for col in vel_cols:
+        f[f'vel_{col}'] = (f[col] - prev[col]) if prev and col in prev else 0.0
+
+    return f
+
+
+def _knee_valgus(n_func, side):
+    """
+    Перпендикулярное смещение колена от линии бедро→лодыжка.
+    Положительное = колено ушло вовнутрь (valgus).
+    Отрицательное = наружу (varus).
+    Работает при ФРОНТАЛЬНОЙ съёмке — там X-смещение максимально.
+    """
+    hip   = n_func(f'{side}_hip')
+    knee  = n_func(f'{side}_knee')
+    ankle = n_func(f'{side}_ankle')
+    limb_vec  = ankle - hip
+    limb_unit = limb_vec / (np.linalg.norm(limb_vec) + 1e-6)
+    knee_vec  = knee - hip
+    proj      = np.dot(knee_vec, limb_unit)
+    perp      = knee_vec - proj * limb_unit
+    return perp[0] if side == 'left' else -perp[0]
+
+
+def _knee_width_ratio(n_func):
+    """
+    Ширина коленей / ширина лодыжек.
+    ~1.0 = норма, >1.0 = широко, <1.0 = узко.
+    Инвариантен к масштабу — это отношение.
+    """
+    knee_w  = abs(n_func('left_knee')[0]  - n_func('right_knee')[0])
+    ankle_w = abs(n_func('left_ankle')[0] - n_func('right_ankle')[0])
+    return knee_w / (ankle_w + 1e-6)
+
+
+def _rounded_back(n_func):
+    """
+    mid_shoulder_y - nose_y (в MediaPipe Y растёт вниз).
+    Прямая спина: нос выше плеч → значение > 0.
+    Горб: нос опускается до уровня плеч → значение уменьшается / становится < 0.
+    Работает фронтально, сзади и при диагональной съёмке.
+    """
+    nose   = n_func('nose')
+    mid_sh = (n_func('left_shoulder') + n_func('right_shoulder')) / 2
+    return mid_sh[1] - nose[1]
+
+
+def _spine_flexion(n_func):
+    """
+    Угол наклона корпуса от вертикали.
+    0° = идеально вертикально, растёт при наклоне вперёд/назад.
+    Лучше всего при БОКОВОЙ съёмке.
+    """
+    mid_sh  = (n_func('left_shoulder') + n_func('right_shoulder')) / 2
+    mid_hip = (n_func('left_hip')      + n_func('right_hip'))      / 2
+    return np.degrees(np.arctan2(
+        abs(mid_sh[0] - mid_hip[0]),
+        abs(mid_sh[1] - mid_hip[1]) + 1e-6
+    ))
+
+
+def _lumbar_extension(n_func):
+    """
+    mid_hip_x - mid_shoulder_x.
+    Норма ≈ 0.
+    Бёдра вперёд (прогиб поясницы) → положительное.
+    Откидывание назад → отрицательное.
+    abs() в detect_errors ловит оба случая.
+    """
+    mid_sh  = (n_func('left_shoulder') + n_func('right_shoulder')) / 2
+    mid_hip = (n_func('left_hip')      + n_func('right_hip'))      / 2
+    return mid_hip[0] - mid_sh[0]
+
+
+def extract_features_for_analysis(lm):          # signature unchanged
+    """Thin wrapper around the shared analysis extractor used in tests."""
+    return shared_extract_features_for_analysis(lm, get_coords, normalize)
+
+def predict_exercise(feat_dict):
+    col_order = scaler.feature_names_in_ if hasattr(scaler, 'feature_names_in_') else feature_order
+    X = pd.DataFrame([{k: feat_dict.get(k, 0.0) for k in col_order}])
+    X_sc = scaler.transform(X)
+    pred  = model.predict(X_sc)[0]
+    proba = model.predict_proba(X_sc)[0]
+    return le.inverse_transform([pred])[0], float(proba[pred])
+
+
 
 def generate_report(session_error_counts: dict, total_frames: int, duration_sec: float) -> str:
-    """
-    Генерирует текстовый отчёт по итогам сессии.
-    session_error_counts: {error_name: кол-во кадров с этой ошибкой}
-    total_frames: сколько кадров было в сессии
-    duration_sec: продолжительность в секундах
-    """
     lines = []
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
@@ -275,8 +328,6 @@ def generate_report(session_error_counts: dict, total_frames: int, duration_sec:
     lines.append(f'Кадров        : {total_frames}')
     lines.append('')
 
-    # Фильтруем только ошибки которые встречались достаточно часто —
-    # порог 5% от кадров отсекает случайные выбросы детектора
     significant = {
         err: cnt for err, cnt in session_error_counts.items()
         if total_frames > 0 and (cnt / total_frames) >= 0.05
@@ -288,7 +339,6 @@ def generate_report(session_error_counts: dict, total_frames: int, duration_sec:
         lines.append('Техника приседаний выглядит хорошо. Продолжайте в том же духе!')
         lines.append('Сохраняйте это качество при увеличении веса или количества повторений.')
     else:
-        # Сортируем по частоте: самая частая ошибка первой
         sorted_errors = sorted(significant.items(), key=lambda x: x[1], reverse=True)
         freq_list = [(err, cnt / total_frames * 100) for err, cnt in sorted_errors]
 
@@ -328,11 +378,7 @@ def save_report(report_text: str) -> str:
         f.write(report_text)
     return filename
 
-# ── State machine 
-# IDLE       — ждём пробел
-# COUNTDOWN  — 7-секундный обратный отсчёт
-# RECORDING  — идёт анализ
-# DONE       — сессия завершена, предлагаем сохранить отчёт
+# ── State machine ─────────────────────────────────────────────────────────────
 STATE_IDLE      = 'IDLE'
 STATE_COUNTDOWN = 'COUNTDOWN'
 STATE_RECORDING = 'RECORDING'
@@ -340,7 +386,7 @@ STATE_DONE      = 'DONE'
 
 COUNTDOWN_SECONDS = 7
 
-# ── UI константы ─
+# ── UI константы ──────────────────────────────────────────────────────────────
 DISPLAY_NAMES = {
     'squats_down': 'Squats (down)', 'squats_up':    'Squats (up)',
     'pushups_down': 'Push-ups (down)', 'pushups_up': 'Push-ups (up)',
@@ -356,7 +402,7 @@ CONNECTIONS = [
     (27,31),(28,32),
 ]
 
-# ── Главный цикл 
+# ── Главный цикл ──────────────────────────────────────────────────────────────
 cap = cv2.VideoCapture(0)
 
 state              = STATE_IDLE
@@ -364,7 +410,6 @@ countdown_start    = 0.0
 session_start      = 0.0
 session_frames     = 0
 
-# Real-time буферы
 prev_model_feat    = None
 prev_knee_angle    = None
 label_buffer       = deque(maxlen=10)
@@ -372,7 +417,6 @@ error_buffer       = deque(maxlen=6)
 current_label      = 'Waiting...'
 confidence         = 0.0
 
-# Накопитель ошибок за всю сессию: {error_name: total_frames_with_error}
 session_error_counts: dict = {}
 
 timestamp_counter  = 0
@@ -395,7 +439,6 @@ while cap.isOpened():
     timestamp_counter += 33
     result = detector.detect_for_video(mp_image, timestamp_counter)
 
-    # ── Pose detection и классификация (всегда, кроме DONE) 
     active_errors = []
 
     if result.pose_landmarks and state != STATE_DONE:
@@ -426,7 +469,6 @@ while cap.isOpened():
                             analysis_feat, current_label, ref_stats, prev_knee_angle)
                         error_buffer.append(set(raw_errors))
 
-                        # Накапливаем в сессию только во время RECORDING
                         if state == STATE_RECORDING:
                             session_frames += 1
                             for err in raw_errors:
@@ -437,13 +479,11 @@ while cap.isOpened():
                     error_buffer.clear()
                     prev_knee_angle = None
         except Exception:
-            pass
+            print(f'[WARN] frame error: {type(e).__name__}: {e}')
 
-    # Ошибки для real-time UI показываем только если они стабильные — встречаются в большинстве последних кадров
     stable_errors = Counter(err for s in error_buffer for err in s)
     active_errors  = [err for err, cnt in stable_errors.items() if cnt >= 3]
 
-    # Переходы между состояниями
     if state == STATE_COUNTDOWN:
         elapsed = time.time() - countdown_start
         remaining = COUNTDOWN_SECONDS - elapsed
@@ -455,7 +495,7 @@ while cap.isOpened():
             error_buffer.clear()
             prev_knee_angle = None
 
-    # ── Рендер UI
+    # ── Рендер UI ─────────────────────────────────────────────────────────────
     overlay = frame.copy()
     cv2.rectangle(overlay, (0, 0), (w, 200), (0, 0, 0), -1)
     cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
@@ -488,7 +528,6 @@ while cap.isOpened():
         cv2.putText(frame, f'Conf: {confidence*100:.0f}%',
                     (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200,200,200), 1)
 
-        # Индикатор записи
         rec_color = (0, 0, 255) if int(time.time() * 2) % 2 == 0 else (0, 0, 180)
         cv2.circle(frame, (w - 30, 25), 10, rec_color, -1)
         cv2.putText(frame, f'REC  {duration:.0f}s  {session_frames} frames',
@@ -513,7 +552,6 @@ while cap.isOpened():
         cv2.putText(frame, f'Duration: {duration:.0f}s   Frames: {session_frames}',
                     (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200,200,200), 1)
 
-        # Показываем топ ошибок прямо на экране
         significant = {
             err: cnt for err, cnt in session_error_counts.items()
             if session_frames > 0 and (cnt / session_frames) >= 0.05
@@ -537,13 +575,12 @@ while cap.isOpened():
 
     cv2.imshow('Exercise Analyzer', frame)
 
-    # Обработка клавиш
     key = cv2.waitKey(1) & 0xFF
 
     if key == ord('q'):
         break
 
-    elif key == ord(' '):  # SPACE
+    elif key == ord(' '):
         if state == STATE_IDLE:
             state = STATE_COUNTDOWN
             countdown_start = time.time()
@@ -553,12 +590,10 @@ while cap.isOpened():
             state = STATE_DONE
             duration = time.time() - session_start
             print(f'\nSession stopped. Duration: {duration:.1f}s, Frames: {session_frames}')
-            # Печатаем превью отчёта в консоль
             report = generate_report(session_error_counts, session_frames, duration)
             print(report)
 
         elif state == STATE_DONE:
-            # Начать заново
             state = STATE_IDLE
             label_buffer.clear()
             error_buffer.clear()
@@ -574,7 +609,6 @@ while cap.isOpened():
             report = generate_report(session_error_counts, session_frames, duration)
             path = save_report(report)
             print(f'Report saved → {path}')
-            # Показываем путь на экране на 2 секунды
             saved_msg_until = time.time() + 2.0
             while time.time() < saved_msg_until:
                 ret2, f2 = cap.read()
