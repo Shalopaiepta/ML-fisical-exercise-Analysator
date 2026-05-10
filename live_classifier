@@ -15,6 +15,16 @@ from error_detection import (
     spine_angle_3d,
 )
 
+
+SUPPORTED_PHASES = ('squats_down', 'squats_up', 'pushups_down', 'pushups_up')
+REFERENCE_GROUPS = {
+    'squats': ('squats_down', 'squats_up'),
+    'pushups': ('pushups_down', 'pushups_up'),
+}
+LABEL_SMOOTHING_FRAMES = 8
+ERROR_SMOOTHING_FRAMES = 12
+ERROR_CONFIRM_FRAMES = 7
+
 # ── Загрузка артефактов ──────────────────────────────────────────────────────
 model        = joblib.load('exercise_classifier_final.pkl')
 scaler       = joblib.load('angle_scaler_final.pkl')
@@ -23,7 +33,7 @@ feature_order = joblib.load('feature_order.pkl')
 
 REF_DIR = r'Datasets'
 ref_stats = {}
-for phase in ['squats_down', 'squats_up']:
+for phase in SUPPORTED_PHASES:
     path = os.path.join(REF_DIR, f'reference_{phase}.csv')
     if os.path.exists(path):
         df = pd.read_csv(path)
@@ -36,83 +46,80 @@ for phase in ['squats_down', 'squats_up']:
                     s = max(s, 5.0)
                 elif 'ratio' in key or 'offset' in key:
                     s = max(s, 0.05)
-                stats[key] = {'mean': m, 'std': s}
+                stats[key] = {
+                    'mean': m,
+                    'std': s,
+                    'median': df[col].median(),
+                    'q10': df[col].quantile(0.10),
+                    'q50': df[col].quantile(0.50),
+                    'q90': df[col].quantile(0.90),
+                }
         ref_stats[phase] = stats
 
 if not ref_stats:
-    print("Warning: Reference files not found. Form analysis disabled.")
+    print("Warning: Reference files not found. Form analysis will use fallback thresholds.")
 
 
 ERROR_DESCRIPTIONS = {
     'Insufficient depth': (
-        'Глубина приседания недостаточна.',
-        'Опускайтесь ниже — бёдра должны быть как минимум параллельны полу. '
-        'Представьте, что садитесь на стул позади себя.'
+        'Squat depth is insufficient.',
+        'Lower deeper until the thighs are at least parallel to the floor. '
+        'Think about sitting back onto a chair behind you.'
     ),
-    'Excessive forward lean': (
-        'Корпус слишком сильно наклоняется вперёд при опускании.',
-        'Работайте над подвижностью голеностопа и держите грудь поднятой. '
-        'Приседания на ящик помогут освоить вертикальное положение корпуса.'
-    ),
+    
     'Not fully extended': (
-        'В верхней точке колени не разгибаются полностью.',
-        'Вставайте до конца в верхней точке каждого повторения. '
-        'Сжимайте ягодицы в верхней точке для полного выпрямления.'
+        'The knees are not fully extended at the top.',
+        'Stand all the way up at the end of each rep and squeeze the glutes to finish the lockout.'
     ),
     'Rounded back': (
-        'Спина округляется — обнаружен горб.',
-        'Держите грудь высоко, сводите лопатки вместе. '
-        'Следите за тем чтобы уши находились над плечами, а не впереди них. '
-        'Упражнения на верхнюю спину (тяги, подтягивания) помогут исправить это.'
+        'The back is rounding.',
+        'Keep the chest high, pull the shoulder blades back, and keep the ears stacked over the shoulders.'
     ),
     'Hips shifting': (
-        'Таз смещается в сторону во время движения.',
-        'Это часто указывает на дисбаланс сгибателей бедра или ягодиц. '
-        'Односторонние упражнения (выпады, болгарские приседания) выровняют нагрузку.'
+        'The hips are shifting sideways during the movement.',
+        'This often points to a left-right imbalance. Single-leg work such as lunges or split squats can help.'
     ),
-    'Leaning at top': (
-        'В верхней точке корпус наклоняется вперёд вместо вертикального положения.',
-        'Концентрируйтесь на выталкивании бёдер вперёд при выпрямлении. '
-        'Ягодичные мосты и тяги бедра укрепят этот паттерн движения.'
-    ),
-    'Stance width off': (
-        'Ширина постановки стоп нестабильна или отличается от вашей нормы.',
-        'Найдите комфортную ширину стойки (обычно на ширине плеч) и придерживайтесь её. '
-        'Метки на полу помогут сохранять одинаковую постановку ног.'
-    ),
+    
+    
     'Leg asymmetry': (
-        'Обнаружена значительная асимметрия углов в левом и правом колене.',
-        'Это может указывать на дисбаланс силы или подвижности. '
-        'Односторонние упражнения и растяжка сгибателей бедра помогут выровнять нагрузку.'
+        'A noticeable left-right leg asymmetry was detected.',
+        'This may indicate a strength or mobility imbalance. Single-leg work and mobility drills can help.'
     ),
-    'Heels lifting': (
-        'Пятки отрываются от пола во время приседания.',
-        'Причина — недостаточная подвижность голеностопа или тугие икры. '
-        'Растягивайте икроножные мышцы перед тренировкой или временно используйте подпятник.'
-    ),
+   
     'Knee valgus (left)': (
-        'Левое колено заваливается вовнутрь.',
-        'Толкайте колено наружу — в сторону мизинца стопы. '
-        'Ягодичный мостик с резинкой укрепит отводящие мышцы.'
+        'The left knee collapses inward.',
+        'Drive the knee outward in line with the foot. Band glute work can help strengthen the abductors.'
     ),
     'Knee valgus (right)': (
-        'Правое колено заваливается вовнутрь.',
-        'Толкайте колено наружу — в сторону мизинца стопы. '
-        'Ягодичный мостик с резинкой укрепит отводящие мышцы.'
+        'The right knee collapses inward.',
+        'Drive the knee outward in line with the foot. Band glute work can help strengthen the abductors.'
     ),
     'Knees too wide': (
-        'Колени разводятся слишком широко.',
-        'Удерживайте колени над средним пальцем стопы на протяжении всего движения.'
+        'The knees are moving too wide.',
+        'Keep the knees tracking over the middle of the foot through the whole rep.'
     ),
-    'Knees caving in': (
-        'Оба колена сводятся вовнутрь.',
-        'Представьте что хотите разорвать пол между ногами — активирует отводящие мышцы.'
+    'Hip sagging': (
+        'Pelvis drops during the push-up.',
+        'Keep a straight plank line and brace the abs before lowering.'
     ),
-    'Lumbar hyperextension': (
-        'Чрезмерный прогиб поясницы или откидывание таза назад.',
-        'Сохраняйте нейтральное положение поясницы. '
-        'Напрягайте пресс на протяжении всего движения.'
+    'Hands too wide': (
+        'Hands are wider than the reference push-up stance.',
+        'Bring the hands closer to shoulder line.'
     ),
+    'Hands too narrow': (
+        'Hands are narrower than the reference push-up stance.',
+        'Move the hands a little wider for more stable support.'
+    ),
+    'Feet too wide': (
+        'Feet are wider than the reference push-up stance.',
+        'Bring the feet closer to your usual push-up stance.'
+    ),
+    'Feet too narrow': (
+        'Feet are narrower than the reference push-up stance.',
+        'Move the feet a little wider if balance feels unstable.'
+    ),
+
+
 }
 # ── MediaPipe ────────────────────────────────────────────────────────────────
 base_options = python.BaseOptions(model_asset_path='pose_landmarker_full.task')
@@ -142,7 +149,7 @@ def get_coords(lm):
     """
     idx_map = {
         'nose': 0,
-        'left_ear': 7, 'right_ear': 8,          # ← нужны для spine_angle
+        'left_ear': 7, 'right_ear': 8,          #← нужны для spine_angle
         'left_shoulder': 11, 'right_shoulder': 12,
         'left_elbow': 13, 'right_elbow': 14,
         'left_wrist': 15, 'right_wrist': 16,
@@ -315,17 +322,76 @@ def predict_exercise(feat_dict):
     return le.inverse_transform([pred])[0], float(proba[pred])
 
 
+def reference_ready(family: str) -> bool:
+    phases = REFERENCE_GROUPS.get(family, ())
+    return bool(phases) and all(ref_stats.get(phase) for phase in phases)
 
-def generate_report(session_error_counts: dict, total_frames: int, duration_sec: float) -> str:
+
+def reference_status_text() -> str:
+    squat_status = 'OK' if reference_ready('squats') else 'MISSING'
+    pushup_status = 'OK' if reference_ready('pushups') else 'MISSING'
+    return f'Squat ref: {squat_status} | Push-up ref: {pushup_status}'
+
+
+def detect_session_family(session_label_counts: dict) -> str | None:
+    if not session_label_counts:
+        return None
+
+    family_counts = Counter()
+    for label, count in session_label_counts.items():
+        if label.startswith('squats'):
+            family_counts['squats'] += count
+        elif label.startswith('pushups'):
+            family_counts['pushups'] += count
+
+    if not family_counts:
+        return None
+    if len(family_counts) == 1:
+        return next(iter(family_counts))
+
+    top_two = family_counts.most_common(2)
+    if top_two[0][1] >= top_two[1][1] * 1.5:
+        return top_two[0][0]
+    return 'mixed'
+
+
+REPORT_TITLES = {
+    'squats': 'SQUAT TECHNIQUE ANALYSIS',
+    'pushups': 'PUSH-UP TECHNIQUE ANALYSIS',
+    'mixed': 'EXERCISE TECHNIQUE ANALYSIS',
+    None: 'EXERCISE TECHNIQUE ANALYSIS',
+}
+SUCCESS_MESSAGES = {
+    'squats': (
+        'Squat technique looks good. Keep it up!\n'
+        'Try to preserve this quality as you increase weight or reps.'
+    ),
+    'pushups': (
+        'Push-up technique looks good. Keep it up!\n'
+        'Maintain a stable plank line and consistent hand placement.'
+    ),
+    'mixed': 'Exercise technique looks good. Keep it up!',
+    None: 'Exercise technique looks good. Keep it up!',
+}
+
+
+
+def generate_report(
+    session_error_counts: dict,
+    total_frames: int,
+    duration_sec: float,
+    session_label_counts: dict | None = None,
+) -> str:
     lines = []
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    family = detect_session_family(session_label_counts or {})
 
     lines.append('=' * 60)
-    lines.append('      АНАЛИЗ ТЕХНИКИ ПРИСЕДАНИЙ')
+    lines.append(f'      {REPORT_TITLES.get(family, REPORT_TITLES[None])}')
     lines.append('=' * 60)
-    lines.append(f'Дата          : {now}')
-    lines.append(f'Продолжит.    : {duration_sec:.1f} сек')
-    lines.append(f'Кадров        : {total_frames}')
+    lines.append(f'Date          : {now}')
+    lines.append(f'Duration      : {duration_sec:.1f} sec')
+    lines.append(f'Frames        : {total_frames}')
     lines.append('')
 
     significant = {
@@ -334,46 +400,52 @@ def generate_report(session_error_counts: dict, total_frames: int, duration_sec:
     }
 
     if not significant:
-        lines.append('РЕЗУЛЬТАТ: Значимых ошибок не обнаружено.')
+        lines.append('RESULT: No significant errors detected.')
         lines.append('')
-        lines.append('Техника приседаний выглядит хорошо. Продолжайте в том же духе!')
-        lines.append('Сохраняйте это качество при увеличении веса или количества повторений.')
+        lines.append(SUCCESS_MESSAGES.get(family, SUCCESS_MESSAGES[None]))
     else:
         sorted_errors = sorted(significant.items(), key=lambda x: x[1], reverse=True)
         freq_list = [(err, cnt / total_frames * 100) for err, cnt in sorted_errors]
 
-        lines.append(f'РЕЗУЛЬТАТ: обнаружено нарушений — {len(significant)}.')
+        lines.append(f'RESULT: {len(significant)} issue(s) detected.')
         lines.append('')
-        lines.append('СВОДКА')
+        lines.append('SUMMARY')
         lines.append('-' * 40)
         for err, pct in freq_list:
             bar = '█' * int(pct / 5)
             lines.append(f'  {err:<28} {pct:5.1f}%  {bar}')
         lines.append('')
 
-        lines.append('ПОДРОБНЫЙ РАЗБОР')
+        lines.append('DETAILS')
         lines.append('-' * 40)
         for i, (err, pct) in enumerate(freq_list, 1):
-            short_desc, advice = ERROR_DESCRIPTIONS.get(err, (err, 'Дополнительных рекомендаций нет.'))
+            short_desc, advice = ERROR_DESCRIPTIONS.get(err, (err, 'No additional recommendations.'))
             lines.append(f'{i}. {err}  ({pct:.1f}% of frames)')
-            lines.append(f'   Что произошло : {short_desc}')
-            lines.append(f'   Как исправить : {advice}')
+            lines.append(f'   What happened : {short_desc}')
+            lines.append(f'   How to fix    : {advice}')
             lines.append('')
 
-        lines.append('ПРИОРИТЕТ')
+        lines.append('PRIORITY')
         lines.append('-' * 40)
         top_err, top_pct = freq_list[0]
         short_desc, advice = ERROR_DESCRIPTIONS.get(top_err, (top_err, ''))
-        lines.append(f'Сосредоточьтесь сначала на "{top_err}" — встречалось в {top_pct:.1f}% кадров.')
+        lines.append(f'Focus on "{top_err}" first — it appeared in {top_pct:.1f}% of frames.')
         lines.append(f'{advice}')
 
     lines.append('')
     lines.append('=' * 60)
     return '\n'.join(lines)
 
-def save_report(report_text: str) -> str:
+def save_report(report_text: str, session_label_counts: dict | None = None) -> str:
     os.makedirs('Reports', exist_ok=True)
-    filename = f'Reports/squat_report_{datetime.now().strftime("%Y%m%d_%H%M%S")}.txt'
+    family = detect_session_family(session_label_counts or {})
+    prefix = {
+        'squats': 'squat',
+        'pushups': 'pushup',
+        'mixed': 'exercise',
+        None: 'exercise',
+    }.get(family, 'exercise')
+    filename = f'Reports/{prefix}_report_{datetime.now().strftime("%Y%m%d_%H%M%S")}.txt'
     with open(filename, 'w', encoding='utf-8') as f:
         f.write(report_text)
     return filename
@@ -388,8 +460,10 @@ COUNTDOWN_SECONDS = 7
 
 # ── UI константы ──────────────────────────────────────────────────────────────
 DISPLAY_NAMES = {
-    'squats_down': 'Squats (down)', 'squats_up':    'Squats (up)',
-    'pushups_down': 'Push-ups (down)', 'pushups_up': 'Push-ups (up)',
+    'squats_down': 'Squats: bottom position',
+    'squats_up': 'Squats: top position',
+    'pushups_down': 'Push-ups: bottom position',
+    'pushups_up': 'Push-ups: top position',
 }
 COLORS = {
     'squats_down': (0, 100, 255), 'squats_up':    (0, 100, 255),
@@ -404,20 +478,21 @@ CONNECTIONS = [
 
 # ── Главный цикл ──────────────────────────────────────────────────────────────
 cap = cv2.VideoCapture(0)
-
 state              = STATE_IDLE
 countdown_start    = 0.0
 session_start      = 0.0
+session_duration_sec = 0.0
 session_frames     = 0
 
 prev_model_feat    = None
 prev_knee_angle    = None
-label_buffer       = deque(maxlen=10)
-error_buffer       = deque(maxlen=6)
+label_buffer       = deque(maxlen=LABEL_SMOOTHING_FRAMES)
+error_buffer       = deque(maxlen=ERROR_SMOOTHING_FRAMES)
 current_label      = 'Waiting...'
 confidence         = 0.0
 
 session_error_counts: dict = {}
+session_label_counts: dict = {}
 
 timestamp_counter  = 0
 
@@ -426,6 +501,7 @@ print("  SPACE — start countdown (7s) then begin recording")
 print("  SPACE — stop recording and show report options")
 print("  R     — save report to file (after session ends)")
 print("  Q     — quit")
+print(f"  {reference_status_text()}")
 
 while cap.isOpened():
     ret, frame = cap.read()
@@ -462,27 +538,28 @@ while cap.isOpened():
                 confidence = new_conf
                 prev_model_feat = model_feat
 
-                if 'squats' in current_label:
+                if current_label in SUPPORTED_PHASES and state == STATE_RECORDING:
                     analysis_feat = extract_features_for_analysis(lm)
                     if analysis_feat:
                         raw_errors, prev_knee_angle = detect_errors(
                             analysis_feat, current_label, ref_stats, prev_knee_angle)
                         error_buffer.append(set(raw_errors))
 
-                        if state == STATE_RECORDING:
-                            session_frames += 1
-                            for err in raw_errors:
-                                session_error_counts[err] = session_error_counts.get(err, 0) + 1
+                        session_label_counts[current_label] = session_label_counts.get(current_label, 0) + 1
+                        session_frames += 1
+                        for err in raw_errors:
+                            session_error_counts[err] = session_error_counts.get(err, 0) + 1
                     else:
                         prev_knee_angle = None
+                        error_buffer.clear()
                 else:
                     error_buffer.clear()
                     prev_knee_angle = None
-        except Exception:
+        except Exception as e:
             print(f'[WARN] frame error: {type(e).__name__}: {e}')
 
     stable_errors = Counter(err for s in error_buffer for err in s)
-    active_errors  = [err for err, cnt in stable_errors.items() if cnt >= 3]
+    active_errors = [err for err, cnt in stable_errors.items() if cnt >= ERROR_CONFIRM_FRAMES]
 
     if state == STATE_COUNTDOWN:
         elapsed = time.time() - countdown_start
@@ -490,8 +567,10 @@ while cap.isOpened():
         if remaining <= 0:
             state = STATE_RECORDING
             session_start = time.time()
+            session_duration_sec = 0.0
             session_frames = 0
             session_error_counts = {}
+            session_label_counts = {}
             error_buffer.clear()
             prev_knee_angle = None
 
@@ -509,9 +588,9 @@ while cap.isOpened():
                     (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200,200,200), 1)
         cv2.putText(frame, 'IDLE — Press SPACE to start',
                     (20, 105), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200,200,0), 2)
-        cv2.putText(frame, f'Ref: {"LOADED" if ref_stats else "MISSING"}',
+        cv2.putText(frame, reference_status_text(),
                     (20, 135), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                    (0,255,0) if ref_stats else (0,100,255), 1)
+                    (0,255,0) if reference_ready('squats') or reference_ready('pushups') else (0,100,255), 1)
 
     elif state == STATE_COUNTDOWN:
         elapsed   = time.time() - countdown_start
@@ -541,15 +620,14 @@ while cap.isOpened():
                 cv2.putText(frame, f'  {err}',
                             (20, y_err), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 2)
                 y_err += 28
-        elif 'squats' in current_label:
+        elif 'squats' in current_label or 'pushups' in current_label:
             cv2.putText(frame, '  Good form', (20, y_err),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
 
     elif state == STATE_DONE:
-        duration = time.time() - session_start
         cv2.putText(frame, 'SESSION COMPLETE',
                     (20, 45), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0,255,200), 2)
-        cv2.putText(frame, f'Duration: {duration:.0f}s   Frames: {session_frames}',
+        cv2.putText(frame, f'Duration: {session_duration_sec:.0f}s   Frames: {session_frames}',
                     (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200,200,200), 1)
 
         significant = {
@@ -588,9 +666,14 @@ while cap.isOpened():
 
         elif state == STATE_RECORDING:
             state = STATE_DONE
-            duration = time.time() - session_start
-            print(f'\nSession stopped. Duration: {duration:.1f}s, Frames: {session_frames}')
-            report = generate_report(session_error_counts, session_frames, duration)
+            session_duration_sec = time.time() - session_start
+            print(f'\nSession stopped. Duration: {session_duration_sec:.1f}s, Frames: {session_frames}')
+            report = generate_report(
+                session_error_counts,
+                session_frames,
+                session_duration_sec,
+                session_label_counts,
+            )
             print(report)
 
         elif state == STATE_DONE:
@@ -598,6 +681,8 @@ while cap.isOpened():
             label_buffer.clear()
             error_buffer.clear()
             session_error_counts = {}
+            session_label_counts = {}
+            session_duration_sec = 0.0
             session_frames = 0
             prev_model_feat = None
             prev_knee_angle = None
@@ -605,9 +690,13 @@ while cap.isOpened():
 
     elif key == ord('r'):
         if state == STATE_DONE:
-            duration = time.time() - session_start
-            report = generate_report(session_error_counts, session_frames, duration)
-            path = save_report(report)
+            report = generate_report(
+                session_error_counts,
+                session_frames,
+                session_duration_sec,
+                session_label_counts,
+            )
+            path = save_report(report, session_label_counts)
             print(f'Report saved → {path}')
             saved_msg_until = time.time() + 2.0
             while time.time() < saved_msg_until:
